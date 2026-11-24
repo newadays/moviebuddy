@@ -599,13 +599,13 @@ function makeOwnBlock() {
           Make it your own <span class="own-arrow" aria-hidden="true">${open ? '↓' : '→'}</span>
         </button>
         <div class="own-choices" id="own-choices"${open ? '' : ' hidden'}>
-          <button type="button" class="own-choice" data-action="start-group">
-            <span class="own-choice__title">Watch with friends <span aria-hidden="true">→</span></span>
-            <span class="own-choice__text">Send one link. Everyone adds their mood, their time and their services, and the agent finds films the whole group can watch.</span>
-          </button>
           <button type="button" class="own-choice" data-action="start-solo">
             <span class="own-choice__title">Just me <span aria-hidden="true">→</span></span>
-            <span class="own-choice__text">Your mood, your time, your services. The agent finds three films for you in about a minute.</span>
+            <span class="own-choice__text">Your mood, your time and every service you subscribe to. The agent searches them all and finds three films for you in about a minute.</span>
+          </button>
+          <button type="button" class="own-choice" data-action="start-group">
+            <span class="own-choice__title">Watch with friends <span aria-hidden="true">→</span></span>
+            <span class="own-choice__text">Send one link. The agent searches across everyone's subscriptions for films the whole group can watch.</span>
           </button>
         </div>
       </section>`;
@@ -618,11 +618,11 @@ function homeScreen() {
   return `
     <div class="wrap home">
       <section class="pitch">
-        <h1 tabindex="-1">Agree on a film, <em>together.</em></h1>
-        <p class="lede">Send one link. Everyone adds their mood, their time and their streaming services. The Movie Buddy agent finds three films the whole group can watch tonight.</p>
+        <h1 tabindex="-1">Every subscription. <em>One search.</em></h1>
+        <p class="lede">Tell Movie Buddy your mood, your time and the streaming services you pay for. The agent searches all of them at once and finds three films you can watch tonight, no flicking between apps.</p>
         <div class="cta">
-          <button type="button" class="button button--primary" data-action="start-group">Watch with friends</button>
-          <button type="button" class="button" data-action="start-solo">Just me</button>
+          <button type="button" class="button button--primary" data-action="start-solo">Just me</button>
+          <button type="button" class="button" data-action="start-group">Watch with friends</button>
           <small>${caption}</small>
         </div>
         ${wallBlock()}
@@ -632,9 +632,9 @@ function homeScreen() {
     </div>
     <section class="steps">
       <div class="wrap steps-grid">
-        <div class="step"><b>1</b><h2>Everyone answers</h2><p>Mood, time and the services each of you has.</p></div>
-        <div class="step"><b>2</b><h2>The agent searches</h2><p>It looks across all of your services for films that fit the group.</p></div>
-        <div class="step"><b>3</b><h2>Swipe and match</h2><p>Each of you votes in private. You see where you all agree.</p></div>
+        <div class="step"><b>1</b><h2>Add your subscriptions</h2><p>Netflix, Max, Prime Video, whatever you pay for, plus your mood and your time.</p></div>
+        <div class="step"><b>2</b><h2>The agent searches them all</h2><p>One search across every service you have, for films released in the last two years.</p></div>
+        <div class="step"><b>3</b><h2>Swipe and watch</h2><p>Right if you would watch it. With friends, everyone votes in private and you see where you agree.</p></div>
       </div>
     </section>`;
 }
@@ -735,7 +735,7 @@ function servicesScreen() {
       <div class="stack">
         ${stepHeader()}
         <h1 class="title" tabindex="-1">Where do you watch?</h1>
-        <p class="muted" style="margin:0">Choose every service you have. The agent searches all of the group's services together.</p>
+        <p class="muted" style="margin:0">Choose every service you subscribe to. ${state.mode === 'solo' ? 'The agent searches all of them at once.' : 'The agent searches everyone\'s subscriptions together.'}</p>
       </div>
       <div class="options options--grid">${buttons}</div>
       ${stepFooter(isLast ? 'Join the group' : 'Continue')}
