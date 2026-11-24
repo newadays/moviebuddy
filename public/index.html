@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="An agent that helps a group of friends agree on a film across the streaming services they have.">
+  <title>Movie Buddy</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Instrument+Sans:wght@400;500;600&display=swap">
+  <meta name="theme-color" content="#000000">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <button type="button" class="brand" data-action="home">Movie Buddy</button>
+    <div class="header-actions">
+      <!-- Rounds this visitor has left today. Opens the usage screen. -->
+      <button type="button" class="meter" id="meter" data-action="usage">10 rounds left</button>
+      <button type="button" class="link-button" id="start-over" data-action="home" hidden>Start over</button>
+    </div>
+  </header>
+
+  <!-- Shown only when no server answers and the page runs on built-in sample titles. -->
+  <p class="mode-note" id="mode-note" hidden>Sample mode: no server is connected, so this is solo only with three stand-in titles.</p>
+
+  <!-- app.js renders every screen into this element. -->
+  <main id="app" class="app"></main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <span>Movie Buddy. An agent built on Muse Ember.</span>
+      <span>This product uses the TMDB API but is not endorsed or certified by TMDB. Streaming availability by JustWatch.</span>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+{
+  // Movie Buddy on Cloudflare Workers: the site and its API in one deploy.
+  "name": "movie-buddy",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-11-01",
+
+  // The site. Files in ./public are served directly at no cost; only /api/*
+  // requests run the Worker.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+
+  // Groups, usage counters, the spend total and the trace log.
+  // Create it with:  npx wrangler kv namespace create USAGE
+  // and paste the id it prints here.
+  "kv_namespaces": [
+    { "binding": "USAGE", "id": "8ab5d22ba8174c4a8438e6c1de62ff5f" }
+  ],
+
+  "vars": {
+    // Hard ceiling, in US dollars, on what the whole site may ever spend on
+    // Muse Ember. Past it the agent is switched off. The hackathon limit is
+    // $10 and going over disqualifies, so keep a margin, and subtract anything
+    // you spend on the same Meta account outside this site.
+    "BUDGET_USD": "8.00",
+
+    // Per-visitor and per-day limits on starting rounds.
+    "ROUNDS_PER_DAY": "10",
+    "EXTRA_ROUNDS": "5",
+    "DAILY_ROUND_CAP": "400",
+
+    // How a round's three films are found.
+    // "random": one film drawn at random from the last two years for each of
+    //   the group's genres, then explained by the agent (default).
+    // "agent": the agent chooses its own searches (AGENT below applies).
+    "PICKER": "random",
+
+    // With PICKER "agent": "on" lets the agent search; "off": one-call pipeline only.
+    "AGENT": "on"
+  },
+
+  // Flood protection: at most 150 API requests a minute from one address.
+  // Each open page checks on its group every four seconds (15 a minute), so
+  // this leaves room for a whole group on one wifi.
+  // namespace_id is any number you choose; it just names this counter.
+  "ratelimits": [
+    { "name": "API_LIMIT", "namespace_id": "1001", "simple": { "limit": 150, "period": 60 } }
+  ]
+}

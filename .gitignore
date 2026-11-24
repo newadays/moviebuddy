@@ -1,0 +1,5 @@
+# Secrets and local state. This repository is public.
+.dev.vars
+.env
+node_modules/
+.wrangler/

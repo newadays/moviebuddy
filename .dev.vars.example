@@ -1,0 +1,10 @@
+# Local secrets for `npm run dev`. Copy to .dev.vars and fill in.
+# .dev.vars is git-ignored: this repository is public, so never commit keys.
+
+MODEL_API_KEY=your-meta-model-api-key
+TMDB_TOKEN=your-tmdb-api-read-access-token
+VISITOR_SALT=any-long-random-string
+ADMIN_KEY=another-long-random-string
+
+# Leave out locally to skip the human check:
+# TURNSTILE_SECRET=your-turnstile-secret-key
