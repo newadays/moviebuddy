@@ -298,7 +298,7 @@ const state = {
   usageFrom: 'home',
   usageNote: '',
   hostName: '',
-  makeOwn: false, // home page: the "Make it your own" choices are open
+  makeOwn: false, // home page: the "Pick your own" choices are open
   filmOpen: -1, // home page: which film tile has its details open (tap or click)
 };
 
@@ -589,14 +589,14 @@ function picksBlock() {
       </section>`;
 }
 
-// "Make it your own": one giant button that opens the two ways to set up
+// "Pick your own": one giant button that opens the two ways to set up
 // the agent. Each choice starts the same flow as the buttons at the top.
 function makeOwnBlock() {
   const open = state.makeOwn;
   return `
       <section class="own">
         <button type="button" class="own-button" data-action="make-own" aria-expanded="${open}" aria-controls="own-choices">
-          Make it your own <span class="own-arrow" aria-hidden="true">${open ? '↓' : '→'}</span>
+          Pick your own <span class="own-arrow" aria-hidden="true">${open ? '↓' : '→'}</span>
         </button>
         <div class="own-choices" id="own-choices"${open ? '' : ' hidden'}>
           <button type="button" class="own-choice" data-action="start-solo">
