@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import worker from '../src/worker.js';
 import { makeKV, makeAssets, installFetchMock, calls, mock } from './mocks.mjs';
+import { reciprocalRank, averagePrecision, ndcg, scoreList } from '../src/metrics.js';
 
 installFetchMock();
 const SITE = 'https://moviebuddy.example';
@@ -757,6 +758,8 @@ await test('replace: "Not for me" swaps only that card, free, until the matches 
     ({ status } = await post(e, `/api/party/${id}/replace`, { mid: HOST, round: 1, filmId: (await state(e, id, HOST)).picks[0].id }));
   }
   assert.equal(status, 404, 'no-more once the reserve is used up');
+  const last = (await state(e, id, HOST)).picks[0].id;
+  assert.equal(JSON.parse(e.USAGE.map.get(`eval:${id}:1:fb`)).labels[last].grade, 0, '"Not for me" is kept even with nothing to swap in');
   assert.equal((await post(e, `/api/party/${await party(e)}/replace`, { mid: HOST, round: 1, filmId: '1' })).status, 403, 'groups cannot replace');
 });
 
@@ -840,6 +843,132 @@ await test('share: at most 30 new links a day from one visitor', async () => {
   const record = JSON.parse(e.USAGE.map.get(key));
   e.USAGE.map.set(key, JSON.stringify({ ...record, shares: 30 }));
   assert.equal((await post(e, `/api/party/${id}/share`, { mid: HOST, round: 1 })).status, 429);
+});
+
+// ---------------------------------------------------------------- evaluation
+
+const kvJson = (e, key) => JSON.parse(e.USAGE.map.get(key) || 'null');
+const stats = async (e) => (await call(e, '/api/stats')).data;
+
+await test('metrics: MRR, MAP and NDCG by hand', async () => {
+  assert.equal(reciprocalRank([0, 2, 1], 2), 0.5);
+  assert.equal(reciprocalRank([0, 1, 0], 2), 0, 'Maybe is not relevant for MRR');
+  assert.equal(averagePrecision([2, 0, 2], 2), (1 + 2 / 3) / 2);
+  assert.equal(ndcg([2, 1, 0]), 1, 'best first is perfect');
+  // DCG = 3/log2(3) + 1/2; ideal = 3 + 1/log2(3)
+  const expected = (3 / Math.log2(3) + 0.5) / (3 + 1 / Math.log2(3));
+  assert.ok(Math.abs(ndcg([0, 2, 1]) - expected) < 1e-12);
+  assert.equal(ndcg([0, 0, 0]), 0);
+});
+
+await test('evaluation: a Just me round keeps the list shown with the ranker\'s places, and no personal details', async () => {
+  const e = env();
+  const id = await soloParty(e);
+  const r = await tasteRound(e, id, { ratings: [rated(900, 'like', {})] });
+  const list = kvJson(e, `eval:${id}:1`);
+  assert.equal(list.flow, 'taste');
+  assert.deepEqual(list.shown.map((f) => f.id), r.data.party.picks.map((p) => p.id), 'in the order shown');
+  assert.ok(list.shown.every((f) => Number.isInteger(f.rank) && f.rank >= 1 && typeof f.score === 'number'));
+  assert.ok(list.ranked.length >= 3);
+  const text = JSON.stringify(list);
+  assert.ok(!text.includes(HOST) && !text.includes('Gbenga'), 'no mid or name');
+  assert.ok(!JSON.stringify(r.data).includes('"rank"'), 'ranks stay on the server');
+});
+
+await test('feedback: grades are kept, the footer averages update, and a changed grade is not counted twice', async () => {
+  const e = env();
+  const id = await soloParty(e);
+  const r = await tasteRound(e, id, { ratings: [rated(900, 'like', {})] });
+  const [a, b, c] = r.data.party.picks.map((p) => p.id);
+  const used = r.data.usage.used;
+  calls.ember.length = 0;
+  const grade = (filmId, g) => post(e, `/api/party/${id}/feedback`, { mid: HOST, round: 1, filmId, grade: g });
+  assert.equal((await grade(a, 1)).status, 200);
+  assert.equal((await grade(b, 2)).status, 200);
+  assert.equal((await stats(e)).recommendations.taste.rated, 0, 'not counted until all three are graded');
+  assert.equal((await grade(c, 0)).status, 200);
+  let s = (await stats(e)).recommendations.taste;
+  assert.equal(s.rated, 1);
+  const want = scoreList([1, 2, 0], 2);
+  assert.equal(s.mrr, Math.round(want.rr * 1000) / 1000);
+  assert.equal(s.ndcg, Math.round(want.ndcg * 1000) / 1000);
+  await grade(a, 2); // changes their mind
+  s = (await stats(e)).recommendations.taste;
+  assert.equal(s.rated, 1, 'still one list');
+  assert.equal(s.mrr, 1);
+  assert.equal(kvJson(e, `eval:${id}:1:fb`).labels[a].grade, 2);
+  assert.equal(calls.ember.length, 0, 'no Ember call');
+  assert.equal((await call(e, '/api/usage')).data.usage.used, used, 'no round used');
+
+  await post(e, `/api/party/${id}/feedback`, { mid: HOST, round: 1, filmId: a, grade: 'click' });
+  await post(e, `/api/party/${id}/feedback`, { mid: HOST, round: 1, filmId: a, grade: 'click' });
+  assert.deepEqual(kvJson(e, `eval:${id}:1:fb`).clicks, [a], 'a click is noted once');
+  assert.equal((await stats(e)).usage.clicks, 1);
+
+  assert.equal((await grade(a, 5)).status, 400, 'bad grade');
+  assert.equal((await grade('123456', 2)).status, 404, 'not a film in this round');
+  assert.equal((await post(e, `/api/party/${id}/feedback`, { mid: DANA, round: 1, filmId: a, grade: 2 })).status, 403, 'only the owner');
+  assert.equal((await post(e, `/api/party/${await party(e)}/feedback`, { mid: HOST, round: 1, filmId: a, grade: 2 })).status, 403, 'not for groups');
+});
+
+await test('feedback: "Not for me" is a 0 for that film, and the swap is kept with its place in the ranking', async () => {
+  const e = env();
+  const id = await soloParty(e);
+  const r = await tasteRound(e, id, { ratings: [rated(900, 'like', {})] });
+  const before = r.data.party.picks.map((p) => p.id);
+  const swapped = await post(e, `/api/party/${id}/replace`, { mid: HOST, round: 1, filmId: before[1] });
+  const fb = kvJson(e, `eval:${id}:1:fb`);
+  assert.equal(fb.labels[before[1]].grade, 0);
+  assert.equal(fb.swaps.length, 1);
+  assert.deepEqual({ pos: fb.swaps[0].pos, from: fb.swaps[0].from, to: fb.swaps[0].to }, { pos: 2, from: before[1], to: swapped.data.party.picks[1].id });
+  assert.ok(Number.isInteger(fb.swaps[0].rank));
+  // The film swapped in can be graded too.
+  assert.equal((await post(e, `/api/party/${id}/feedback`, { mid: HOST, round: 1, filmId: fb.swaps[0].to, grade: 2 })).status, 200);
+  assert.equal((await stats(e)).usage.swaps, 1);
+});
+
+await test('evaluation: group votes are labels per member (P1, P2), each a rated list', async () => {
+  const e = env();
+  const id = await party(e);
+  await post(e, `/api/party/${id}/join`, { mid: DANA, name: 'Dana', answers: { mood: 'lighter', time: 'medium', services: [8] } });
+  const r = await round(e, id);
+  const ids = r.data.party.picks.map((p) => p.id);
+  const list = kvJson(e, `eval:${id}:1`);
+  assert.equal(list.groupSize, 2);
+  assert.ok(list.shown.every((f) => f.rank === null), 'groups are not ranked by taste');
+  await vote(e, id, HOST, 1, [{ id: ids[0], vote: 'no' }, { id: ids[1], vote: 'yes' }, { id: ids[2], vote: 'yes' }]);
+  await vote(e, id, DANA, 1, [{ id: ids[0], vote: 'yes' }, { id: ids[1], vote: 'no' }, { id: ids[2], vote: 'no' }]);
+  assert.deepEqual(kvJson(e, `eval:${id}:1:v:P1`).labels, { [ids[0]]: 0, [ids[1]]: 1, [ids[2]]: 1 });
+  assert.deepEqual(kvJson(e, `eval:${id}:1:v:P2`).labels, { [ids[0]]: 1, [ids[1]]: 0, [ids[2]]: 0 });
+  const s = (await stats(e)).recommendations.group;
+  assert.equal(s.rated, 2);
+  assert.equal(s.mrr, Math.round(((0.5 + 1) / 2) * 1000) / 1000);
+  assert.ok(!JSON.stringify([...e.USAGE.map].filter(([k]) => k.startsWith('eval:'))).includes(DANA), 'no mids');
+});
+
+await test('stats: seeded once from the rounds already kept; public, with no personal details', async () => {
+  const e = env();
+  e.USAGE.map.set('p:old1:r:1', JSON.stringify({ createdAt: '2026-11-24T10:00:00.000Z', rules: { taste: true } }));
+  e.USAGE.map.set('p:old2:r:1', JSON.stringify({ createdAt: '2026-11-25T10:00:00.000Z', rules: {} }));
+  e.USAGE.map.set('p:old2:r:1:v:hosthosthosthost', JSON.stringify({ votes: [] }));
+  const s = await stats(e);
+  assert.deepEqual(s.usage.rounds, { taste: 1, group: 1 });
+  assert.equal(s.since, '2026-11-24T10:00:00.000Z');
+  assert.equal(s.recommendations.taste.mrr, null);
+  const id = await soloParty(e);
+  await tasteRound(e, id, { ratings: [rated(900, 'like', {})] });
+  assert.deepEqual((await stats(e)).usage.rounds, { taste: 2, group: 1 }, 'a new round counted once');
+});
+
+await test('admin feedback export: needs the key, then returns the eval records', async () => {
+  const e = env({ ADMIN_KEY: 'secret' });
+  const id = await soloParty(e);
+  await tasteRound(e, id, { ratings: [rated(900, 'like', {})] });
+  const get = (key) => worker.fetch(new Request(SITE + '/api/admin/feedback', { headers: key ? { Authorization: `Bearer ${key}` } : {} }), e);
+  assert.equal((await get()).status, 404);
+  assert.equal((await get('wrong')).status, 404);
+  const data = await (await get('secret')).json();
+  assert.ok(data.records.some((r) => r.key === `eval:${id}:1` && r.value.shown.length === 3));
 });
 
 console.log(`\n${passed} tests passed`);

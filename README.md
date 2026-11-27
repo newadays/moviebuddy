@@ -250,6 +250,42 @@ outside this site, such as Muse Code or tests with curl. Lower `BUDGET_USD` by
 that amount. The total is an estimate at list prices and is kept in a store
 with no atomic counter, so leave a margin; do not set it to 10.
 
+## How good are the recommendations?
+
+Every list of three films shown is kept, with the labels people give it, so
+the recommendations can be measured with MRR, MAP@3 and NDCG@3.
+
+- **Just me:** each result asks "How's this pick?" with *Would watch* (2),
+  *Maybe* (1) and *Not for me* (0; it also swaps the film). Clicking
+  "Watch on …" is noted too.
+- **Groups:** each person's yes/no votes are the labels (1 / 0).
+
+A film is relevant (for MRR and MAP) at *Would watch* or a yes vote; NDCG uses
+every grade (gain 2^grade − 1). The formulas are in `src/metrics.js`.
+
+What is stored, in KV, for a year, with no ids, names or places (people in a
+group are P1, P2…):
+
+| Key | What |
+|---|---|
+| `eval:<party>:<n>` | the three films in the order shown; for Just me, each film's place and score in the ranker's list, and its top 10 |
+| `eval:<party>:<n>:fb` | Just me grades, swaps and watch clicks |
+| `eval:<party>:<n>:v:P<i>` | one group member's votes |
+| `stats` | running totals for the footer |
+
+**Data for Nerds 🤓**, at the foot of every page, shows the running totals
+from `GET /api/stats`: usage, and MRR / MAP@3 / NDCG@3 for Just me and for
+groups once each has five fully rated lists. KV has no atomic counter, so the
+footer is a live gauge. For exact figures:
+
+```
+ADMIN_KEY=... npm run feedback -- https://moviebuddy.workhelio.com
+```
+
+writes `feedback.jsonl` (one labelled list per line) and prints the metrics
+recomputed from the raw labels, plus NDCG@3 for the ranker's own order of the
+same films, to show whether the agent's reordering helps.
+
 ## Proof of usage
 
 The submission needs a prompt/token trace and a Usage-page screenshot.

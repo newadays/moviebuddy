@@ -4,11 +4,12 @@
   "type": "module",
   "description": "An agent, built on Muse Ember, that helps a group of friends agree on a film.",
   "scripts": {
-    "test": "node test/worker.test.mjs",
+    "test": "node --check public/app.js && node test/worker.test.mjs",
     "local": "node test/dev-server.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "trace": "node scripts/export-trace.mjs"
+    "trace": "node scripts/export-trace.mjs",
+    "feedback": "node scripts/export-feedback.mjs"
   },
   "devDependencies": {
     "wrangler": "^4"

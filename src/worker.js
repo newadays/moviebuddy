@@ -1,3 +1,5 @@
+import { scoreList } from './metrics.js';
+
 /*
  * Movie Buddy: Cloudflare Worker.
  *
@@ -13,6 +15,7 @@
  *   POST /api/party/:id/replace      Just me: swap one result for the next best match (free)
  *   GET  /api/rate-films?genres=     Just me: well-known films to rate, about ten per genre
  *   POST /api/party/:id/share        Just me: a read-only link to this round's three (free)
+ *   POST /api/party/:id/feedback     Just me: Would watch / Maybe / Not for me on one result (free)
  *   GET  /api/share/:id              a shared three, for the page at /s/:id
  *   GET  /api/providers              streaming services, from TMDB
  *   GET  /api/posters                TMDB's popular films: home-page tiles and the waiting screen
@@ -20,6 +23,8 @@
  *   GET  /api/usage                  this visitor's rounds left today, and the site's budget
  *   POST /api/usage/request          ask for extra rounds (once a day)
  *   GET  /api/admin/trace            every Ember prompt, token count and cost (needs ADMIN_KEY)
+ *   GET  /api/admin/feedback         every ranked list shown and its labels (needs ADMIN_KEY)
+ *   GET  /api/stats                  Data for Nerds: usage and MRR / MAP / NDCG, site-wide
  *
  * The agent chooses what to search for; the Worker enforces what it may not
  * change. Time limit, kid-safety and the group's services are applied to every
@@ -48,6 +53,7 @@ const MAX_TOOL_STEPS = 3; // tool calls the agent may make before it must answer
 const MAX_ROUND_TOKENS = 20000; // ceiling for one round, all Ember calls together
 const PARTY_TTL = 60 * 60 * 24 * 2; // groups live two days
 const LOG_TTL = 60 * 60 * 24 * 30; // rounds and votes are kept 30 days for evaluation
+const EVAL_TTL = 60 * 60 * 24 * 365; // ranked lists and their labels: a year, no names
 const TWO_DAYS = 60 * 60 * 24 * 2;
 
 // Muse Ember list prices in US dollars per million tokens. Used only to show
@@ -1197,7 +1203,8 @@ async function runTastePicker(env, party, rules, taste, seen, trace) {
     });
   });
   ranked.sort((a, b) => b.score - a.score);
-  if (!ranked.length) return { picks: [], reserve: [], fromEmber: 0, invented: 0 };
+  ranked.forEach((c, i) => { c.rank = i + 1; }); // the ranker's own order, kept for evaluation
+  if (!ranked.length) return { picks: [], reserve: [], fromEmber: 0, invented: 0, rankedIds: [] };
 
   // 4. Ember chooses three from the ten best matches.
   const shortlist = ranked.slice(0, TASTE_SHORTLIST);
@@ -1252,8 +1259,8 @@ async function runTastePicker(env, party, rules, taste, seen, trace) {
   // Variety gives way rather than show fewer than three.
   if (chosen.length < 3) chosen = [...chosen, ...ranked.filter((c) => !chosen.some((x) => x.id === c.id)).slice(0, 3 - chosen.length)];
   const reserve = ranked.filter((c) => !chosen.some((x) => x.id === c.id)).slice(0, TASTE_RESERVE)
-    .map((c) => ({ id: c.id, genre: c.genre, becauseId: c.becauseId, becauseTitle: c.becauseTitle, popularIn: c.popularIn }));
-  return { picks: chosen, reserve, fromEmber, invented };
+    .map((c) => ({ id: c.id, genre: c.genre, becauseId: c.becauseId, becauseTitle: c.becauseTitle, popularIn: c.popularIn, rank: c.rank, score: c.score }));
+  return { picks: chosen, reserve, fromEmber, invented, rankedIds: ranked.slice(0, TASTE_SHORTLIST).map((c) => c.id) };
 }
 
 // The extra fields a taste pick carries for the results card.
@@ -1584,7 +1591,7 @@ async function handleRound(request, env, id) {
 
 // Count a round that succeeded and keep its record. The round record doubles
 // as the evaluation log: picks, the trace and the checks, kept 30 days.
-async function saveRound(env, party, picks, trace, ruleSummary, extraRecord, { body, key, record, globalKey, globalUsed }) {
+async function saveRound(env, party, picks, trace, ruleSummary, extraRecord, { body, key, record, globalKey, globalUsed, ranking }) {
   trace.costUsd = costUsd(trace);
   const n = party.round + 1;
   party.round = n;
@@ -1592,7 +1599,13 @@ async function saveRound(env, party, picks, trace, ruleSummary, extraRecord, { b
   record.tokens += trace.tokens;
   record.cost = (record.cost || 0) + trace.costUsd;
 
+  const flow = ruleSummary.taste ? 'taste' : 'group';
+  // Counted before the round is written, so a first-ever read of the totals
+  // (which counts the rounds already kept) does not count this one twice.
+  await bumpStats(env, (s) => { s.rounds[flow] += 1; s.recs[flow].lists += 1; });
+
   await Promise.all([
+    env.USAGE.put(evalKey(party.id, n), JSON.stringify(evalRecord(party, picks, trace, ruleSummary, ranking)), { expirationTtl: EVAL_TTL }),
     env.USAGE.put(roundKey(party.id, n), JSON.stringify({
       n,
       createdAt: new Date().toISOString(),
@@ -1642,7 +1655,7 @@ async function tasteRound(env, party, taste, ctx) {
   return saveRound(env, party, picks, trace,
     { kids: rules.kids, adultsOnly: rules.adultsOnly, services: rules.services.length, taste: true },
     { taste: { liked, disliked: taste.ratings.length - liked, unseen: taste.unseen.length, genres: party.members[0].answers.genres }, reserve: outcome.reserve, dismissed: [] },
-    ctx);
+    { ...ctx, ranking: { ranks: Object.fromEntries(outcome.picks.map((c) => [String(c.id), { rank: c.rank, score: c.score }])), ranked: outcome.rankedIds } });
 }
 
 // POST /api/party/:id/replace  { mid, round, filmId }
@@ -1666,20 +1679,32 @@ async function handleReplace(request, env, id) {
   const genreCount = (party.members[0].answers.genres || []).length;
   round.dismissed = [...(round.dismissed || []), round.picks[at].id];
   let replacement = null;
+  let taken = null;
   while (!replacement) {
     const [next] = takeVaried(round.reserve, 1, genreCount, others);
     if (!next) break;
     round.reserve = round.reserve.filter((c) => c.id !== next.id);
     const details = await filmDetails(env, next.id).catch(() => null);
-    if (details) replacement = shapePick(details, party, tasteExtra(next, details, rules));
+    if (details) {
+      replacement = shapePick(details, party, tasteExtra(next, details, rules));
+      taken = next;
+    }
   }
   if (!replacement) {
     await env.USAGE.put(roundKey(party.id, n), JSON.stringify(round), { expirationTtl: LOG_TTL });
+    // Nothing to swap in, but "Not for me" is still a grade of 0 for this film.
+    await labelTaste(env, party.id, n, round.picks[at].id, 0);
     return json({ error: 'no-more' }, 404);
   }
+  const dismissedId = round.picks[at].id;
   round.picks[at] = replacement;
   delete round.shareId; // the three changed: the next share is a new snapshot
   await env.USAGE.put(roundKey(party.id, n), JSON.stringify(round), { expirationTtl: LOG_TTL });
+  // "Not for me" is a grade of 0, and the swap is kept with the new film's place in the ranking.
+  await labelTaste(env, party.id, n, dismissedId, 0, (fb) => {
+    fb.swaps.push({ pos: at + 1, from: dismissedId, to: replacement.id, rank: taken.rank || null, score: taken.score == null ? null : taken.score });
+  });
+  await bumpStats(env, (s) => { s.swaps += 1; });
   return json({ party: await partyState(env, party, body.mid) });
 }
 
@@ -1709,7 +1734,187 @@ async function handleVotes(request, env, id) {
     reason: String(v.reason || '').slice(0, 40),
   }));
   await env.USAGE.put(votesKey(party.id, n, body.mid), JSON.stringify({ at: new Date().toISOString(), votes }), { expirationTtl: LOG_TTL });
+  // For evaluation: yes = 1, no = 0, under the member's position (P1, P2...), not their id.
+  const member = `P${party.members.findIndex((m) => m.mid === body.mid) + 1}`;
+  await labelGroup(env, party.id, n, member, Object.fromEntries(votes.map((v) => [v.id, v.vote === 'yes' ? 1 : 0])));
   return json({ party: await partyState(env, party, body.mid) });
+}
+
+// ---------------------------------------------------------------------------
+// Evaluation: every ranked list shown, with its labels, for MRR, MAP and NDCG
+// ---------------------------------------------------------------------------
+//
+//   eval:<party>:<n>          the list as shown: films in order, and for Just me
+//                             each film's place and score in the ranker's list
+//   eval:<party>:<n>:fb       Just me: grades (2 Would watch, 1 Maybe, 0 Not
+//                             for me), swaps and watch clicks
+//   eval:<party>:<n>:v:P<i>   groups: one member's yes (1) / no (0) votes
+//
+// Kept a year. No ids, names or places: members are P1, P2...
+// scripts/export-feedback.mjs downloads them and computes the full report;
+// the running totals below feed the footer.
+
+const evalKey = (id, n, suffix = '') => `eval:${id}:${n}${suffix}`;
+const STATS_KEY = 'stats';
+const RELEVANT_AT = { taste: 2, group: 1 }; // Would watch; a yes vote
+
+function evalRecord(party, picks, trace, rules, ranking) {
+  const ranks = (ranking && ranking.ranks) || {};
+  return {
+    v: 1,
+    at: new Date().toISOString(),
+    flow: rules.taste ? 'taste' : (trace.variant || 'group'),
+    groupSize: party.members.length,
+    kids: !!rules.kids,
+    adultsOnly: !!rules.adultsOnly,
+    genres: [...new Set(party.members.flatMap((m) => m.answers.genres || []))],
+    shown: picks.map((p, i) => ({
+      pos: i + 1,
+      id: p.id,
+      title: p.title,
+      genre: p.primaryGenre || p.pickedFor || '',
+      rank: ranks[p.id] ? ranks[p.id].rank : null,
+      score: ranks[p.id] && typeof ranks[p.id].score === 'number' ? Math.round(ranks[p.id].score * 1000) / 1000 : null,
+      byEmber: !!p.byEmber,
+      because: p.becauseTitle || (p.popularIn ? `popular in ${p.popularIn}` : ''),
+    })),
+    ranked: (ranking && ranking.ranked) || [],
+  };
+}
+
+// The list's grades in the order shown, or null until every film has one.
+function gradesOf(shown, labels) {
+  const grades = shown.map((f) => (labels[f.id] == null ? null : (typeof labels[f.id] === 'object' ? labels[f.id].grade : labels[f.id])));
+  return grades.every((g) => g != null) ? grades : null;
+}
+
+function emptyStats() {
+  const recs = () => ({ lists: 0, rated: 0, rr: 0, ap: 0, ndcg: 0 });
+  return { since: new Date().toISOString(), rounds: { taste: 0, group: 0 }, shares: 0, swaps: 0, clicks: 0, recs: { taste: recs(), group: recs() } };
+}
+
+// The totals, created the first time from the rounds already kept.
+async function readStats(env) {
+  const stats = await env.USAGE.get(STATS_KEY, 'json');
+  if (stats) return stats;
+  const seeded = emptyStats();
+  let cursor;
+  const names = [];
+  do {
+    const page = await env.USAGE.list({ prefix: 'p:', cursor, limit: 1000 });
+    names.push(...page.keys.map((k) => k.name).filter((name) => /^p:[a-z0-9]+:r:\d+$/.test(name)));
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
+  const rounds = await Promise.all(names.slice(0, 500).map((name) => env.USAGE.get(name, 'json').catch(() => null)));
+  rounds.filter(Boolean).forEach((r) => {
+    const flow = r.rules && r.rules.taste ? 'taste' : 'group';
+    seeded.rounds[flow] += 1;
+    if (r.createdAt && r.createdAt < seeded.since) seeded.since = r.createdAt;
+  });
+  return seeded;
+}
+
+// KV has no atomic add: re-read just before writing, as addSpend does. Two
+// writes at the same instant can lose one count; the export recomputes exactly.
+async function bumpStats(env, change) {
+  const stats = await readStats(env);
+  change(stats);
+  await env.USAGE.put(STATS_KEY, JSON.stringify(stats));
+}
+
+// Move a list's contribution from its old score to its new one, so a changed
+// grade never counts a list twice.
+function moveScore(recs, before, after) {
+  if (before) { recs.rated -= 1; recs.rr -= before.rr; recs.ap -= before.ap; recs.ndcg -= before.ndcg; }
+  if (after) { recs.rated += 1; recs.rr += after.rr; recs.ap += after.ap; recs.ndcg += after.ndcg; }
+}
+
+// Just me: one grade (0, 1, 2) for one film, plus any change to the record.
+async function labelTaste(env, partyId, n, filmId, grade, change) {
+  const list = await env.USAGE.get(evalKey(partyId, n), 'json');
+  if (!list) return null;
+  const fb = (await env.USAGE.get(evalKey(partyId, n, ':fb'), 'json')) || { labels: {}, swaps: [], clicks: [], score: null };
+  if (grade != null) fb.labels[filmId] = { grade, at: new Date().toISOString() };
+  if (change) change(fb);
+  const before = fb.score;
+  const grades = gradesOf(list.shown, fb.labels);
+  fb.score = grades ? scoreList(grades, RELEVANT_AT.taste) : null;
+  await env.USAGE.put(evalKey(partyId, n, ':fb'), JSON.stringify(fb), { expirationTtl: EVAL_TTL });
+  if (JSON.stringify(before) !== JSON.stringify(fb.score)) await bumpStats(env, (s) => moveScore(s.recs.taste, before, fb.score));
+  return fb;
+}
+
+// Groups: one member's votes on one round.
+async function labelGroup(env, partyId, n, member, labels) {
+  const list = await env.USAGE.get(evalKey(partyId, n), 'json');
+  if (!list) return;
+  const key = evalKey(partyId, n, `:v:${member}`);
+  const old = await env.USAGE.get(key, 'json');
+  const grades = gradesOf(list.shown, labels);
+  const score = grades ? scoreList(grades, RELEVANT_AT.group) : null;
+  await env.USAGE.put(key, JSON.stringify({ at: new Date().toISOString(), labels, score }), { expirationTtl: EVAL_TTL });
+  const before = old ? old.score : null;
+  if (JSON.stringify(before) !== JSON.stringify(score)) await bumpStats(env, (s) => moveScore(s.recs.group, before, score));
+}
+
+// POST /api/party/:id/feedback  { mid, round, filmId, grade: 0 | 1 | 2 | "click" }
+// Just me: how good one result is. Free: no round, no Ember.
+async function handleFeedback(request, env, id) {
+  const body = await request.json().catch(() => null);
+  if (!body) return json({ error: 'bad-request' }, 400);
+  const click = body.grade === 'click';
+  if (!click && ![0, 1, 2].includes(body.grade)) return json({ error: 'bad-grade' }, 400);
+  const party = await loadParty(env, id);
+  if (!party) return json({ error: 'not-found' }, 404);
+  if (!party.solo || body.mid !== party.hostMid) return json({ error: 'solo-only' }, 403);
+  const n = Number(body.round);
+  if (!Number.isInteger(n) || n < 1 || n > party.round) return json({ error: 'bad-round' }, 400);
+  const list = await env.USAGE.get(evalKey(party.id, n), 'json');
+  if (!list) return json({ error: 'bad-round' }, 400);
+  const filmId = String(body.filmId || '');
+  const fb = (await env.USAGE.get(evalKey(party.id, n, ':fb'), 'json')) || { swaps: [] };
+  const known = list.shown.some((f) => f.id === filmId) || (fb.swaps || []).some((x) => x.to === filmId);
+  if (!known) return json({ error: 'not-in-round' }, 404);
+
+  if (click) {
+    let fresh = false;
+    await labelTaste(env, party.id, n, filmId, null, (record) => {
+      if (!record.clicks.includes(filmId)) { record.clicks.push(filmId); fresh = true; }
+    });
+    if (fresh) await bumpStats(env, (s) => { s.clicks += 1; });
+  } else {
+    await labelTaste(env, party.id, n, filmId, body.grade);
+  }
+  return json({ ok: true });
+}
+
+// GET /api/stats  Data for Nerds: site-wide usage and how good the picks are.
+async function handleStats(env) {
+  const [stats, wall, budget] = await Promise.all([readStats(env), readWall(env), budgetView(env)]);
+  const mean = (r) => (r.rated ? {
+    rated: r.rated,
+    mrr: Math.round((r.rr / r.rated) * 1000) / 1000,
+    map: Math.round((r.ap / r.rated) * 1000) / 1000,
+    ndcg: Math.round((r.ndcg / r.rated) * 1000) / 1000,
+  } : { rated: 0, mrr: null, map: null, ndcg: null });
+  return json({
+    since: stats.since,
+    usage: { people: wall.people, rounds: stats.rounds, shares: stats.shares, swaps: stats.swaps, clicks: stats.clicks, spentUsd: budget.spentUsd, limitUsd: budget.limitUsd },
+    recommendations: { taste: { lists: stats.recs.taste.lists, ...mean(stats.recs.taste) }, group: { lists: stats.recs.group.lists, ...mean(stats.recs.group) } },
+  }, 200, { 'Cache-Control': 'public, max-age=60' });
+}
+
+// GET /api/admin/feedback  every eval record, a page at a time (needs ADMIN_KEY).
+async function handleAdminFeedback(request, env) {
+  const auth = request.headers.get('Authorization') || '';
+  if (!env.ADMIN_KEY || auth !== `Bearer ${env.ADMIN_KEY}`) return json({ error: 'not-found' }, 404);
+  const url = new URL(request.url);
+  const listing = await env.USAGE.list({ prefix: 'eval:', cursor: url.searchParams.get('cursor') || undefined, limit: 200 });
+  const values = await Promise.all(listing.keys.map((k) => env.USAGE.get(k.name, 'json')));
+  return json({
+    records: listing.keys.map((k, i) => ({ key: k.name, value: values[i] })).filter((r) => r.value),
+    nextCursor: listing.list_complete ? null : listing.cursor,
+  });
 }
 
 
@@ -1758,6 +1963,7 @@ async function handleShare(request, env, id) {
     env.USAGE.put(roundKey(party.id, n), JSON.stringify(round), { expirationTtl: LOG_TTL }),
     writeRecord(env, key, record),
   ]);
+  await bumpStats(env, (s) => { s.shares += 1; });
   return json({ id: shareId, url: `/s/${shareId}` });
 }
 
@@ -1935,9 +2141,11 @@ export default {
       if (route === 'GET /api/wall') return await handleWall(env);
       if (route === 'GET /api/usage') return await handleUsage(request, env);
       if (route === 'GET /api/admin/trace') return await handleTrace(request, env);
+      if (route === 'GET /api/admin/feedback') return await handleAdminFeedback(request, env);
+      if (route === 'GET /api/stats') return await handleStats(env);
       if (route === 'POST /api/usage/request') return await handleUsageRequest(request, env);
 
-      const party = url.pathname.match(/^\/api\/party\/([a-z0-9]+)(\/(join|round|votes|replace|share))?$/);
+      const party = url.pathname.match(/^\/api\/party\/([a-z0-9]+)(\/(join|round|votes|replace|share|feedback))?$/);
       if (party) {
         const [, id, , action] = party;
         if (request.method === 'GET' && !action) return await handleGetParty(env, id, url.searchParams.get('mid') || '');
@@ -1946,6 +2154,7 @@ export default {
         if (request.method === 'POST' && action === 'votes') return await handleVotes(request, env, id);
         if (request.method === 'POST' && action === 'replace') return await handleReplace(request, env, id);
         if (request.method === 'POST' && action === 'share') return await handleShare(request, env, id);
+        if (request.method === 'POST' && action === 'feedback') return await handleFeedback(request, env, id);
       }
       return json({ error: 'not-found' }, 404);
     } catch (err) {

@@ -967,3 +967,39 @@ textarea { font-size: 16px; resize: vertical; }
   .own-choice,
   .tile-details { transition: none; }
 }
+
+/* ---------- How's this pick? (Just me results) ---------- */
+
+.pick-rate { display: flex; flex-direction: column; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+.pick-rate__buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip--sm { min-height: 36px; padding: 6px 14px; font-size: 14px; }
+.chip--sm[aria-pressed="true"] { padding: 5px 13px; }
+.pick-rate__note { margin: 0; color: var(--ink); }
+
+/* ---------- Data for Nerds (footer, every page) ---------- */
+
+.site-footer .nerds.wrap { display: block; padding-block: 22px 0; font: var(--mb-footer); color: var(--muted); }
+.nerds__title { margin: 0 0 10px; font-size: 14px; font-weight: 700; color: var(--ink); letter-spacing: 0.02em; }
+.nerds__grid { margin: 0; display: grid; gap: 6px; }
+.nerds__row { display: grid; grid-template-columns: 150px 1fr; gap: 2px 16px; }
+.nerds__row dt { color: var(--ink); font-weight: 600; }
+.nerds__row dd { margin: 0; font-variant-numeric: tabular-nums; }
+.nerds__row--head { margin-top: 6px; }
+.nerds__note { opacity: 0.75; }
+.nerds__help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  cursor: help;
+}
+
+@media (max-width: 560px) {
+  .nerds__row { grid-template-columns: 1fr; }
+}

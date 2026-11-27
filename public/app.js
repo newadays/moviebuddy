@@ -305,6 +305,7 @@ const state = {
   index: 0,
   votes: [], // this person's votes on the current round, in progress
   chosenId: null,
+  cardNote: null, // { id, text }: a message shown on one result card, under its buttons
   share: null, // { url, text, note } while a share panel is open
   notice: '', // one-off message shown at the top of the next screen
   usageFrom: 'home',
@@ -325,6 +326,7 @@ function newTaste() {
     swaps: {}, // genre -> "Haven't seen it" used
     unseen: [], // films swapped away: never recommended back as new
     dismissed: [], // results marked "Not for me"
+    feedback: { round: 0, grades: {} }, // "How's this pick?" on the results: filmId -> 2 | 1
     noLikes: 0, // batches rated with nothing liked
     more: false, // rating more from the results: go straight to a new round
     loading: false,
@@ -346,6 +348,7 @@ function reset(screen, keepAddress) {
     screen, mode: 'solo', answers: { mood: '', genres: [], time: '', services: [] }, kids: false, kidsChosen: false,
     partyId: '', mid: '', party: null, roundShown: 0, index: 0, votes: [],
     chosenId: null, share: null, hostName: '', askName: !profile.name, makeOwn: false, filmOpen: -1,
+    cardNote: null,
     taste: newTaste(),
   });
   if (location.hash && !keepAddress) history.replaceState(null, '', location.pathname + location.search);
@@ -1043,11 +1046,55 @@ function recCard(p, shared) {
           ${because ? `<p class="why">${ICON_UP}<span>${because}</span></p>` : ''}
           ${!shared && p.byEmber && p.why ? `<p class="small muted rec-note">${esc(p.why)}</p>` : ''}
           <div class="rec-actions">
-            ${url ? `<a class="button button--primary button--sm" href="${esc(url)}" target="_blank" rel="noopener">Watch${service ? ` on ${esc(service)}` : ''}</a>` : ''}
-            ${shared ? '' : `<button type="button" class="button button--ghost button--sm" data-action="dismiss-pick" data-id="${esc(p.id)}">Not for me</button>`}
+            ${url ? `<a class="button button--primary button--sm" href="${esc(url)}" target="_blank" rel="noopener"${shared ? '' : ` data-action="watch-click" data-id="${esc(p.id)}"`}>Watch${service ? ` on ${esc(service)}` : ''}</a>` : ''}
           </div>
+          ${shared ? '' : pickRating(p)}
         </div>
       </article>`;
+}
+
+// "How's this pick?": graded feedback that measures the recommendations
+// (MRR, MAP, NDCG). Not for me also swaps the film for the next best match.
+function pickRating(p) {
+  const grade = state.taste.feedback.round === state.roundShown ? state.taste.feedback.grades[p.id] : undefined;
+  const button = (action, label, on) => `<button type="button" class="chip chip--sm" aria-pressed="${on}" data-action="${action}" data-id="${esc(p.id)}">${label}</button>`;
+  return `
+          <div class="pick-rate" role="group" aria-label="How's this pick? ${esc(p.title)}">
+            <span class="small muted">How's this pick?</span>
+            <div class="pick-rate__buttons">
+              ${button('grade-watch', 'Would watch', grade === 2)}
+              ${button('grade-maybe', 'Maybe', grade === 1)}
+              ${button('dismiss-pick', 'Not for me', grade === 0)}
+            </div>
+            ${state.cardNote && state.cardNote.id === p.id ? `<p class="small pick-rate__note" role="status">${esc(state.cardNote.text)}</p>` : ''}
+          </div>`;
+}
+
+// Feedback goes to the server one request at a time, so quick taps arrive in order.
+let feedbackQueue = Promise.resolve();
+function sendFeedback(filmId, grade) {
+  if (sampleMode || !state.partyId) return;
+  const body = { mid: state.mid, round: state.roundShown, filmId, grade };
+  feedbackQueue = feedbackQueue.then(() => fetch(`${API_BASE}/party/${state.partyId}/feedback`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), keepalive: true,
+  })).catch(() => {});
+}
+
+// Remember a grade on this round's card; the server is told unless it already knows.
+function noteGrade(id, grade) {
+  const fb = state.taste.feedback;
+  if (fb.round !== state.roundShown) { fb.round = state.roundShown; fb.grades = {}; }
+  fb.grades[id] = grade;
+}
+
+function gradePick(id, grade) {
+  state.cardNote = null;
+  noteGrade(id, grade);
+  sendFeedback(id, grade);
+  rememberParty();
+  render({ focus: false });
+  const again = app.querySelector(`[data-action="${grade === 2 ? 'grade-watch' : 'grade-maybe'}"][data-id="${CSS.escape(id)}"]`);
+  if (again) again.focus();
 }
 
 // Just me: the three films, each with why it is here.
@@ -1500,7 +1547,7 @@ function startPolling() {
 
 function rememberParty() {
   const t = state.taste;
-  const taste = state.mode === 'solo' ? { slots: t.slots.filter((x) => x.film && x.rating), unseen: t.unseen, dismissed: t.dismissed } : null;
+  const taste = state.mode === 'solo' ? { slots: t.slots.filter((x) => x.film && x.rating), unseen: t.unseen, dismissed: t.dismissed, feedback: t.feedback } : null;
   writeStore(PARTY_KEY, { id: state.partyId, mid: state.mid, name: state.name, answers: state.answers, taste });
   history.replaceState(null, '', `${location.pathname}${location.search}#party-${state.partyId}`);
 }
@@ -1526,6 +1573,7 @@ function adoptParty(party, options) {
       notifyRound(party);
     }
     state.roundShown = party.round;
+    state.cardNote = null;
     state.index = 0;
     state.votes = [];
     state.chosenId = null;
@@ -1885,6 +1933,7 @@ const ACTIONS = {
   },
   'add-service'() { state.screen = 'services'; render(); },
   async 'dismiss-pick'(id) {
+    state.cardNote = null;
     if (!state.taste.dismissed.includes(Number(id))) state.taste.dismissed.push(Number(id));
     try {
       const { status, data } = await api(`/party/${state.partyId}/replace`, { mid: state.mid, round: state.roundShown, filmId: id });
@@ -1899,14 +1948,26 @@ const ACTIONS = {
         if (heading) heading.focus();
         return undefined;
       }
-      state.notice = data.error === 'no-more'
-        ? 'No other films on your services matched. Try "Rate more films" or add a service.'
-        : 'Could not swap that film. Try again.';
+      // Said on the card that was tapped, not at the top of the page.
+      if (data.error === 'no-more') {
+        noteGrade(id, 0); // the server kept the "Not for me"; there is just nothing to swap in
+        rememberParty();
+        state.cardNote = { id, text: 'Noted. No other films on your services matched, so this one stays. Try "Rate more films" or add a service.' };
+      } else {
+        state.cardNote = { id, text: 'Could not swap that film. Try again.' };
+      }
     } catch (err) {
-      state.notice = 'Could not reach Movie Buddy. Check your connection and try again.';
+      state.cardNote = { id, text: 'Could not reach Movie Buddy. Check your connection and try again.' };
     }
-    return render({ focus: false });
+    render({ focus: false });
+    const button = app.querySelector(`[data-action="dismiss-pick"][data-id="${CSS.escape(id)}"]`);
+    if (button) button.focus();
+    return undefined;
   },
+  'grade-watch'(id) { gradePick(id, 2); },
+  'grade-maybe'(id) { gradePick(id, 1); },
+  // The link opens the service as normal; the click is noted on the way.
+  'watch-click'(id) { sendFeedback(id, 'click'); },
   'vote-yes'() { vote('yes'); },
   'vote-no'() { vote('no'); },
   reason(id) { recordVote('no', id); },
@@ -2033,10 +2094,51 @@ async function start() {
   } else if (id) await openParty(id);
   else render({ focus: false });
   loadWall().then(() => { if (state.screen === 'home') render({ focus: false }); });
+  loadNerds();
   // Posters fill the home page's film tiles and the waiting screen.
   loadPosters().then(() => { if (state.screen === 'home') render({ focus: false }); });
   // Logos are a nicety, so the page never waits for them.
   loadServices().then(() => { if (state.screen === 'services') render({ focus: false }); });
+}
+
+// ---------------------------------------------------------------------------
+// Data for Nerds: site-wide usage and how good the recommendations are
+// ---------------------------------------------------------------------------
+
+const NERDS_MIN_LISTS = 5; // fewer rated lists than this and the averages mean little
+const METRICS_HELP = 'MRR: how high the first "Would watch" (or yes vote) sits, 1 = always first. '
+  + 'MAP@3: how high all of them sit, on average. NDCG@3: how close the order is to the best possible, using every grade. '
+  + 'All run from 0 to 1; higher is better.';
+
+function nerdsRow(label, r) {
+  const figures = r.rated >= NERDS_MIN_LISTS && r.mrr != null
+    ? `MRR ${r.mrr.toFixed(2)} · MAP@3 ${r.map.toFixed(2)} · NDCG@3 ${r.ndcg.toFixed(2)} <span class="nerds__note">(${r.rated} rated ${r.rated === 1 ? 'list' : 'lists'})</span>`
+    : `— <span class="nerds__note">(${r.rated} rated so far)</span>`;
+  return `<div class="nerds__row"><dt>${label}</dt><dd>${figures}</dd></div>`;
+}
+
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+async function loadNerds() {
+  const box = document.getElementById('nerds');
+  if (!box || sampleMode) return;
+  try {
+    const res = await fetch(`${API_BASE}/stats`);
+    if (!res.ok) return;
+    const { usage: u, recommendations: r } = await res.json();
+    const total = u.rounds.taste + u.rounds.group;
+    box.innerHTML = `
+      <h2 class="nerds__title" id="nerds-title">Data for Nerds <span aria-hidden="true">🤓</span></h2>
+      <dl class="nerds__grid">
+        <div class="nerds__row"><dt>Usage</dt><dd>${plural(u.people, 'person', 'people')} · ${plural(total, 'round', 'rounds')} (${u.rounds.taste} Just me, ${u.rounds.group} groups) · ${plural(u.shares, 'share', 'shares')} · ${money(u.spentUsd)} of ${money(u.limitUsd)} agent budget</dd></div>
+        <div class="nerds__row nerds__row--head"><dt>Recommendations <span class="nerds__help" tabindex="0" role="note" aria-label="${esc(METRICS_HELP)}" title="${esc(METRICS_HELP)}">?</span></dt><dd></dd></div>
+        ${nerdsRow('Just me', r.taste)}
+        ${nerdsRow('Groups', r.group)}
+      </dl>`;
+    box.hidden = false;
+  } catch (err) {
+    // A nicety: the page works the same without it.
+  }
 }
 
 // Pasting an invite link into a tab that already has the site open.
