@@ -11,6 +11,13 @@
     "binding": "ASSETS"
   },
 
+  // The site's address. Cloudflare creates the DNS record and certificate.
+  // The workers.dev address stays on too, so links made there keep working.
+  "routes": [
+    { "pattern": "moviebuddy.workhelio.com", "custom_domain": true }
+  ],
+  "workers_dev": true,
+
   // Groups, usage counters, the spend total and the trace log.
   // Create it with:  npx wrangler kv namespace create USAGE
   // and paste the id it prints here.
