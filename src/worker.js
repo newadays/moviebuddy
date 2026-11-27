@@ -10,6 +10,10 @@
  *   POST /api/party/:id/join         a friend adds their answers
  *   POST /api/party/:id/round        host asks the agent for three films  <- costs a round
  *   POST /api/party/:id/votes        one member's yes/no votes on a round
+ *   POST /api/party/:id/replace      Just me: swap one result for the next best match (free)
+ *   GET  /api/rate-films?genres=     Just me: well-known films to rate, about ten per genre
+ *   POST /api/party/:id/share        Just me: a read-only link to this round's three (free)
+ *   GET  /api/share/:id              a shared three, for the page at /s/:id
  *   GET  /api/providers              streaming services, from TMDB
  *   GET  /api/posters                TMDB's popular films: home-page tiles and the waiting screen
  *   GET  /api/wall                   who has used the site lately: first names and places
@@ -462,7 +466,10 @@ async function searchFilms(env, wish, rules, seen) {
 }
 
 async function filmDetails(env, id) {
-  return tmdb(env, `/movie/${id}`, { append_to_response: 'watch/providers,videos', language: 'en-US' }, 3600);
+  // Everything any part of the site needs about a film, in one cached call:
+  // where to watch, the trailer, and for taste matching its keywords, credits
+  // and certificate.
+  return tmdb(env, `/movie/${id}`, { append_to_response: 'watch/providers,videos,keywords,credits,release_dates', language: 'en-US' }, 3600);
 }
 
 // Where a film can be watched, and which members of the group have that service.
@@ -921,6 +928,349 @@ async function runRandomPicker(env, party, rules, history, seen, trace) {
   return { picks: films.map((f) => byId.get(f.id)).filter(Boolean), shown };
 }
 
+// ---------------------------------------------------------------------------
+// Just me: rate films, then recommend from what you liked
+// ---------------------------------------------------------------------------
+//
+// Content-based filtering. The person rates well-known films from the genres
+// they picked. Each film is described by its TMDB attributes: genres,
+// keywords, director, lead cast and decade. A like adds those attributes'
+// weights to a taste profile and a dislike takes them away. Recent films on
+// the person's own services are scored against that profile, the best ten
+// go to Ember, and Ember chooses the three to show and says why.
+
+const RATE_PER_GENRE = 10; // films to rate fetched per genre: three to rate, the rest for "Haven't seen it"
+const RATE_VOTE_STEPS = [2000, 300, 50]; // votes a film to rate needs: well known first, lower for thin genres
+const RATE_PAGES = 3; // TMDB's most-voted pages a pool is drawn from
+const TASTE_WEIGHTS = { g: 1, k: 1.5, d: 2, c: 1, e: 0.5 }; // genre, keyword, director, cast, decade
+const TASTE_DETAILS = 32; // candidates looked at closely (keywords, credits, services): 6 searches + 32 + Ember stays under 50 requests
+const TASTE_SHORTLIST = 10; // best matches Ember chooses from
+const TASTE_RESERVE = 15; // next best, kept for "Not for me" on a result
+
+const decadeOf = (date) => (/^\d{4}/.test(date || '') ? Math.floor(Number(date.slice(0, 4)) / 10) * 10 : null);
+
+// The film's US certificate (G, PG, PG-13, R...), or '' if it has none.
+function usCertificate(details) {
+  const us = ((details.release_dates && details.release_dates.results) || []).find((r) => r.iso_3166_1 === 'US');
+  const found = ((us && us.release_dates) || []).find((d) => d.certification);
+  return found ? found.certification : '';
+}
+
+// The attributes taste is measured on.
+function filmFeatures(details) {
+  const crew = (details.credits && details.credits.crew) || [];
+  const cast = (details.credits && details.credits.cast) || [];
+  return {
+    g: (details.genres ? details.genres.map((g) => g.id) : details.genre_ids || []).slice(0, 8),
+    k: ((details.keywords && details.keywords.keywords) || []).map((k) => k.id).slice(0, 12),
+    d: crew.filter((p) => p.job === 'Director').map((p) => p.id).slice(0, 2),
+    c: cast.slice(0, 3).map((p) => p.id),
+    e: decadeOf(details.release_date),
+  };
+}
+
+function featureKeys(f) {
+  const keys = [];
+  ['g', 'k', 'd', 'c'].forEach((type) => (f[type] || []).forEach((id) => keys.push(`${type}:${id}`)));
+  if (f.e) keys.push(`e:${f.e}`);
+  return keys;
+}
+
+// Likes add each attribute's weight, dislikes take it away.
+function tasteProfile(ratings) {
+  const profile = new Map();
+  ratings.forEach((r) => {
+    const sign = r.rating === 'like' ? 1 : -1;
+    featureKeys(r.f).forEach((key) => profile.set(key, (profile.get(key) || 0) + sign * TASTE_WEIGHTS[key[0]]));
+  });
+  return profile;
+}
+
+// How closely a film matches the profile. Dividing by the square root of the
+// number of attributes stops films with long keyword lists winning on size.
+function tasteScore(profile, f) {
+  const keys = featureKeys(f);
+  if (!keys.length) return 0;
+  return keys.reduce((sum, key) => sum + (profile.get(key) || 0), 0) / Math.sqrt(keys.length);
+}
+
+// The liked film that contributes most to a candidate's score: the one
+// sharing the most (and the weightiest) attributes with it.
+function becauseOf(liked, f) {
+  const keys = new Set(featureKeys(f));
+  let best = null;
+  let bestScore = 0;
+  liked.forEach((r) => {
+    const shared = featureKeys(r.f).filter((key) => keys.has(key));
+    const score = shared.reduce((sum, key) => sum + TASTE_WEIGHTS[key[0]], 0);
+    if (score > bestScore) { best = r; bestScore = score; }
+  });
+  return best;
+}
+
+function cleanTaste(raw) {
+  const t = raw && typeof raw === 'object' ? raw : {};
+  const ints = (list, max) => (Array.isArray(list) ? list : []).map(Number).filter((n) => Number.isInteger(n) && n > 0 && n < 1e9).slice(0, max);
+  const ratings = (Array.isArray(t.ratings) ? t.ratings : []).slice(0, 60).map((r) => {
+    const f = (r && r.f) || {};
+    return {
+      filmId: Number(r && r.filmId),
+      title: String((r && r.title) || '').slice(0, 80),
+      genre: GENRE_IDS[r && r.genre] ? r.genre : '',
+      rating: r && r.rating === 'like' ? 'like' : 'dislike',
+      f: { g: ints(f.g, 8), k: ints(f.k, 12), d: ints(f.d, 2), c: ints(f.c, 3), e: Number.isInteger(f.e) && f.e >= 1900 && f.e < 2100 ? f.e : null },
+    };
+  }).filter((r) => Number.isInteger(r.filmId) && r.filmId > 0);
+  return { ratings, unseen: ints(t.unseen, 300), dismissed: ints(t.dismissed, 100) };
+}
+
+// What a film to rate looks like on the page.
+function rateCard(details, genre) {
+  const runtime = details.runtime ? `${Math.floor(details.runtime / 60)}h ${String(details.runtime % 60).padStart(2, '0')}m` : '';
+  return {
+    id: details.id,
+    title: details.title,
+    year: (details.release_date || '').slice(0, 4),
+    runtime,
+    certification: usCertificate(details),
+    poster: details.poster_path ? `${TMDB_IMAGE}/w342${details.poster_path}` : '',
+    overview: firstSentences(details.overview, 140),
+    genre,
+    f: filmFeatures(details),
+  };
+}
+
+const shuffled = (list) => list.map((x) => [Math.random(), x]).sort((a, b) => a[0] - b[0]).map(([, x]) => x);
+
+// GET /api/rate-films?genres=thriller,comedy&exclude=1,2
+// About ten well-known films per genre, no film in two genres, genres in the
+// order given. Free: it does not use a round.
+async function handleRateFilms(env, url) {
+  const genres = [...new Set(String(url.searchParams.get('genres') || '').split(',').map((g) => g.trim().toLowerCase()))]
+    .filter((g) => GENRE_IDS[g]).slice(0, MAX_GENRES);
+  if (!genres.length) return json({ error: 'bad-request' }, 400);
+  const used = new Set(String(url.searchParams.get('exclude') || '').split(',').map(Number).filter((n) => Number.isInteger(n) && n > 0).slice(0, 300));
+
+  const picked = [];
+  for (const genre of genres) {
+    const found = [];
+    const take = (data) => shuffled(((data && data.results) || []).filter((m) => m.poster_path && !used.has(m.id))).forEach((m) => {
+      if (found.length < RATE_PER_GENRE && !used.has(m.id)) { used.add(m.id); found.push(m); }
+    });
+    // The best-known films first. Some genres (documentary, western) have
+    // few films with that many votes, so the bar is lowered until the genre
+    // has enough. Then pages are read from a random start, moving on past
+    // films already shown. At most five searches a genre.
+    const search = (votes, page) => tmdb(env, '/discover/movie', {
+      with_genres: GENRE_IDS[genre], sort_by: 'vote_count.desc', 'vote_count.gte': votes,
+      include_adult: 'false', include_video: 'false', language: 'en-US', page,
+    }, 86400).catch(() => null);
+    let calls = 0;
+    let votes = RATE_VOTE_STEPS[0];
+    let first = null;
+    for (const step of RATE_VOTE_STEPS) {
+      votes = step;
+      first = await search(step, 1);
+      calls += 1;
+      if (((first && first.total_results) || 0) >= 60) break;
+    }
+    const pages = Math.min((first && first.total_pages) || 0, 10);
+    let page = pages > 1 ? 1 + Math.floor(Math.random() * Math.min(pages, RATE_PAGES)) : 1;
+    for (let tried = 0; tried < pages && found.length < RATE_PER_GENRE && calls < 5; tried += 1) {
+      take(page === 1 ? first : (calls += 1, await search(votes, page)));
+      page = (page % pages) + 1;
+    }
+    found.forEach((m) => picked.push({ genre, m }));
+  }
+
+  // Runtime, certificate, keywords and credits for each film. A film whose
+  // details fail still shows, from the search result alone.
+  const cards = await Promise.all(picked.map(async ({ genre, m }) => {
+    const details = await filmDetails(env, m.id).catch(() => null);
+    return rateCard(details || m, genre);
+  }));
+  const films = Object.fromEntries(genres.map((g) => [g, cards.filter((c) => c.genre === g)]));
+  return json({ films }, 200, { 'Cache-Control': 'no-store' });
+}
+
+// One solo person's rules: services and age group. Time is not asked any more.
+function tasteRules(party) {
+  return { ...groupRules(party), runtimeCap: null, time: 'any' };
+}
+
+// Pick the best films in order while keeping variety: no more than two from
+// one genre when two or more genres were picked.
+function takeVaried(ranked, count, genreCount, already = []) {
+  const cap = genreCount >= 2 ? 2 : Infinity;
+  const out = [];
+  const tally = {};
+  already.forEach((c) => { tally[c.genre] = (tally[c.genre] || 0) + 1; });
+  for (const c of ranked) {
+    if (out.length === count) break;
+    if ((tally[c.genre] || 0) >= cap) continue;
+    tally[c.genre] = (tally[c.genre] || 0) + 1;
+    out.push(c);
+  }
+  return out;
+}
+
+const TASTE_SYSTEM = [
+  'You are Movie Buddy, an agent that recommends films to one person from films they told you they liked and did not like.',
+  'You are given those films, whether kids are watching, and a shortlist of recent films on their own streaming services.',
+  'Each shortlisted film has a match score (higher is closer to their taste) and the liked film it is most like ("because_you_liked").',
+  'Recommend the way a friend with good taste would: warm, specific and natural.',
+].join(' ');
+
+const TASTE_INSTRUCTION = [
+  'Choose the three films from the shortlist this person is most likely to enjoy tonight.',
+  'Favour higher match scores, but choose three that differ from each other rather than three of the same kind.',
+  'For each: "id" exactly as given; "why": one natural sentence, at most 25 words, saying what the film is and why it suits them,',
+  'using only facts from the details given (no invented plot, cast or awards), and never mentioning the match score;',
+  '"fits": an empty list.',
+].join(' ');
+
+/*
+ * The taste round. Returns up to three picks (fewer only when fewer films
+ * match), the reserve for replacing one, and what Ember was told.
+ */
+async function runTastePicker(env, party, rules, taste, seen, trace) {
+  const me = party.members[0];
+  const genres = (me.answers.genres || []).length ? me.answers.genres : [...new Set(taste.ratings.map((r) => r.genre).filter(Boolean))];
+  const liked = taste.ratings.filter((r) => r.rating === 'like');
+  const profile = tasteProfile(taste.ratings);
+  const exclude = new Set([...taste.ratings.map((r) => r.filmId), ...taste.unseen, ...taste.dismissed, ...[...seen].map(Number)]);
+
+  // 1. Candidates: recent films in each picked genre on the person's services.
+  const found = new Map();
+  for (const genre of genres) {
+    for (let page = 1; page <= 2; page += 1) {
+      const params = ageFilter({
+        with_genres: GENRE_IDS[genre], sort_by: 'popularity.desc', 'vote_count.gte': 50, 'vote_average.gte': 5.5,
+        'primary_release_date.gte': yearsAgo(RECENT_YEARS), 'primary_release_date.lte': new Date().toISOString().slice(0, 10),
+        include_adult: 'false', include_video: 'false', language: 'en-US', page,
+      }, rules);
+      if (rules.services.length) {
+        params.with_watch_providers = rules.services.join('|');
+        params.watch_region = REGION;
+        params.with_watch_monetization_types = 'flatrate';
+      }
+      const data = await tmdb(env, '/discover/movie', params, 3600).catch(() => null);
+      const results = (data && data.results) || [];
+      trace.steps.push({ kind: 'tool', tool: 'search_films', args: { genre, page, by: 'taste' }, ok: !!data, results: results.length, tokens: 0 });
+      results.forEach((m) => { if (m.poster_path && !exclude.has(m.id) && !found.has(m.id)) found.set(m.id, { m, genre }); });
+      if (!data || page >= (data.total_pages || 0)) break;
+    }
+  }
+
+  // 2. A quick score from what the search returned, to choose which to look at closely.
+  const popularity = (m) => Math.log10(1 + (m.vote_count || 0)) * 0.1;
+  // The closer look is shared between the genres in turn, so every picked
+  // genre has candidates for the variety rule to draw on.
+  const byGenre = genres.map((g) => [...found.values()].filter((c) => c.genre === g)
+    .map((c) => ({ ...c, quick: (liked.length ? tasteScore(profile, filmFeatures(c.m)) : 0) + popularity(c.m) }))
+    .sort((a, b) => b.quick - a.quick));
+  const quick = [];
+  for (let i = 0; quick.length < TASTE_DETAILS && byGenre.some((list) => i < list.length); i += 1) {
+    byGenre.forEach((list) => { if (list[i] && quick.length < TASTE_DETAILS) quick.push(list[i]); });
+  }
+
+  // 3. Full details, the services and age checks, and the real score.
+  const detailed = await Promise.all(quick.map(async (c) => ({ ...c, details: await filmDetails(env, c.m.id).catch(() => null) })));
+  const ranked = [];
+  detailed.forEach(({ m, genre, details }) => {
+    if (!details) return;
+    const region = details['watch/providers'] && details['watch/providers'].results && details['watch/providers'].results[REGION];
+    const flatrate = (region && region.flatrate) || [];
+    if (rules.services.length && !flatrate.some((p) => rules.services.includes(p.provider_id))) return; // not on their services
+    if (rules.kids && !['G', 'PG'].includes(usCertificate(details))) return;
+    if (rules.adultsOnly && (details.genres || []).some((g) => g.id === GENRE_IDS.family)) return;
+    const f = filmFeatures(details);
+    const because = liked.length ? becauseOf(liked, f) : null;
+    ranked.push({
+      id: m.id, genre, details, f,
+      score: liked.length ? tasteScore(profile, f) + popularity(m) : popularity(m) + (m.popularity || 0) / 1000,
+      becauseId: because ? because.filmId : null,
+      becauseTitle: because ? because.title : '',
+      popularIn: liked.length ? '' : genre,
+    });
+  });
+  ranked.sort((a, b) => b.score - a.score);
+  if (!ranked.length) return { picks: [], reserve: [], fromEmber: 0, invented: 0 };
+
+  // 4. Ember chooses three from the ten best matches.
+  const shortlist = ranked.slice(0, TASTE_SHORTLIST);
+  const byId = new Map(ranked.map((c) => [c.id, c]));
+  let chosen = [];
+  let invented = 0;
+  try {
+    const brief = {
+      liked: liked.map((r) => r.title).filter(Boolean),
+      not_for_me: taste.ratings.filter((r) => r.rating === 'dislike').map((r) => r.title).filter(Boolean),
+      kids_watching: rules.kids,
+      shortlist: shortlist.map((c) => ({
+        id: c.id,
+        title: c.details.title,
+        year: (c.details.release_date || '').slice(0, 4),
+        genres: (c.details.genres || []).map((g) => g.name),
+        overview: firstSentences(c.details.overview, 200),
+        match: Math.round(c.score * 100) / 100,
+        because_you_liked: c.becauseTitle || null,
+      })),
+    };
+    const reply = await ember(env, {
+      messages: [
+        { role: 'system', content: TASTE_SYSTEM },
+        { role: 'user', content: JSON.stringify(brief) },
+        { role: 'user', content: TASTE_INSTRUCTION },
+      ],
+      response_format: { type: 'json_schema', json_schema: FINAL_SCHEMA },
+    });
+    addUsage(trace, reply);
+    trace.steps.push({ kind: 'final', tokens: reply.tokens });
+    const answer = JSON.parse(reply.message.content).picks || [];
+    const allowed = new Set(shortlist.map((c) => c.id));
+    for (const p of answer) {
+      const id = Number(p && p.id);
+      if (!allowed.has(id)) { invented += 1; continue; }
+      const why = typeof p.why === 'string' ? p.why.trim().slice(0, 240) : '';
+      if (!why || chosen.some((c) => c.id === id)) continue;
+      chosen.push({ ...byId.get(id), why });
+    }
+    // Ember's choices still follow the variety rule.
+    chosen = takeVaried(chosen, 3, genres.length);
+  } catch (err) {
+    console.error(`taste picker: Ember failed: ${err.message}`);
+    trace.fallback = String(err.message).slice(0, 80);
+    chosen = [];
+  }
+  const fromEmber = chosen.length;
+  // Fewer than three from Ember: top up with the best matches.
+  const rest = ranked.filter((c) => !chosen.some((x) => x.id === c.id));
+  chosen = [...chosen, ...takeVaried(rest, 3 - chosen.length, genres.length, chosen)];
+  // Variety gives way rather than show fewer than three.
+  if (chosen.length < 3) chosen = [...chosen, ...ranked.filter((c) => !chosen.some((x) => x.id === c.id)).slice(0, 3 - chosen.length)];
+  const reserve = ranked.filter((c) => !chosen.some((x) => x.id === c.id)).slice(0, TASTE_RESERVE)
+    .map((c) => ({ id: c.id, genre: c.genre, becauseId: c.becauseId, becauseTitle: c.becauseTitle, popularIn: c.popularIn }));
+  return { picks: chosen, reserve, fromEmber, invented };
+}
+
+// The extra fields a taste pick carries for the results card.
+function tasteExtra(c, details, rules) {
+  const region = details['watch/providers'] && details['watch/providers'].results && details['watch/providers'].results[REGION];
+  const flatrate = (region && region.flatrate) || [];
+  const own = flatrate.find((p) => rules.services.includes(p.provider_id)) || flatrate[0];
+  return {
+    becauseId: c.becauseId ? String(c.becauseId) : '',
+    becauseTitle: c.becauseTitle || '',
+    popularIn: c.popularIn || '',
+    primaryGenre: c.genre,
+    backdrop: details.backdrop_path ? `${TMDB_IMAGE}/w780${details.backdrop_path}` : '',
+    service: own ? { name: own.provider_name, logo: own.logo_path ? `${TMDB_IMAGE}/w92${own.logo_path}` : '' } : null,
+    watchUrl: (region && region.link) || '',
+    certification: usCertificate(details),
+  };
+}
+
 // Never trust model output blindly: keep only films a tool actually returned,
 // and top up from the search results if fewer than three survive.
 function validatePicks(emberPicks, shown, labels) {
@@ -1030,6 +1380,7 @@ async function partyState(env, party, mid) {
     joined: true,
     isHost: mid === party.hostMid,
     solo: party.members.length === 1,
+    justMe: party.solo === true, // the rate-to-recommend flow
     round: party.round,
     members: party.members.map((m) => ({ name: m.name, isYou: m.mid === mid, isHost: m.mid === party.hostMid, voted: false })),
     picks: [],
@@ -1058,6 +1409,7 @@ async function partyState(env, party, mid) {
     estimated: !!t.estimated,
     agent: t.variant === 'agent' && !t.fallback,
     random: t.variant === 'random',
+    taste: t.variant === 'taste',
   };
   state.yourVotes = byMid[mid] ? byMid[mid].votes : null;
   state.allVoted = voters.every((m) => byMid[m.mid]);
@@ -1100,6 +1452,8 @@ async function handleCreateParty(request, env) {
     createdAt: new Date().toISOString(),
     hostMid: body.mid,
     kids: body.kids === true,
+    // "Just me": nobody else can join, and rounds come from the films rated.
+    solo: body.solo === true,
     round: 0,
     members: [{ mid: body.mid, name: cleanName(body.name, 'Host'), answers: cleanAnswers(body.answers) }],
   };
@@ -1124,6 +1478,7 @@ async function handleJoin(request, env, id) {
   if (!party) return json({ error: 'not-found' }, 404);
 
   const existing = party.members.find((m) => m.mid === body.mid);
+  if (party.solo && !existing) return json({ error: 'full' }, 409);
   if (existing) {
     existing.answers = cleanAnswers(body.answers);
     existing.name = cleanName(body.name, existing.name);
@@ -1166,6 +1521,9 @@ async function handleRound(request, env, id) {
     if (!(await isHuman(env, body.turnstileToken, ip))) return json({ error: 'human-check' }, 403);
     record.human = true;
   }
+
+  // Just me, with films rated: the taste round.
+  if (party.solo && body.taste) return tasteRound(env, party, cleanTaste(body.taste), { body, key, record, globalKey, globalUsed });
 
   const rules = groupRules(party);
   const history = await partyHistory(env, party);
@@ -1219,6 +1577,12 @@ async function handleRound(request, env, id) {
   )));
 
   trace.checks = instructionChecks(trace, validation, picks, rules);
+  return saveRound(env, party, picks, trace, { time: rules.time, kids: rules.kids, services: rules.services.length }, {}, { body, key, record, globalKey, globalUsed });
+}
+
+// Count a round that succeeded and keep its record. The round record doubles
+// as the evaluation log: picks, the trace and the checks, kept 30 days.
+async function saveRound(env, party, picks, trace, ruleSummary, extraRecord, { body, key, record, globalKey, globalUsed }) {
   trace.costUsd = costUsd(trace);
   const n = party.round + 1;
   party.round = n;
@@ -1226,17 +1590,16 @@ async function handleRound(request, env, id) {
   record.tokens += trace.tokens;
   record.cost = (record.cost || 0) + trace.costUsd;
 
-  // Count the round only now that it succeeded. The round record doubles as
-  // the evaluation log: picks, the trace and the checks, kept 30 days.
   await Promise.all([
     env.USAGE.put(roundKey(party.id, n), JSON.stringify({
       n,
       createdAt: new Date().toISOString(),
       memberMids: party.members.map((m) => m.mid),
       groupSize: party.members.length,
-      rules: { time: rules.time, kids: rules.kids, services: rules.services.length },
+      rules: ruleSummary,
       picks,
       trace,
+      ...extraRecord,
     }), { expirationTtl: LOG_TTL }),
     saveParty(env, party),
     writeRecord(env, key, record),
@@ -1250,6 +1613,72 @@ async function handleRound(request, env, id) {
     budget: await budgetView(env),
     round: { tokens: trace.tokens, costUsd: trace.costUsd, variant: trace.variant, fallback: trace.fallback, toolCalls: trace.steps.filter((s) => s.kind === 'tool').length, checks: trace.checks },
   });
+}
+
+// Just me: recommend from the films this person rated.
+async function tasteRound(env, party, taste, ctx) {
+  const rules = tasteRules(party);
+  const history = await partyHistory(env, party);
+  const trace = newTrace('taste');
+  let outcome;
+  try {
+    outcome = await runTastePicker(env, party, rules, taste, history.seen, trace);
+  } catch (err) {
+    await recordFailedRound(env, trace, 'error');
+    throw err;
+  }
+  if (!outcome.picks.length) {
+    await recordFailedRound(env, trace, 'no-matches');
+    return json({ error: 'no-matches', usage: usageView(env, ctx.record) }, 404);
+  }
+  const picks = outcome.picks.map((c) => shapePick(c.details, party, {
+    ...(c.why ? { why: c.why, byEmber: true } : {}),
+    ...tasteExtra(c, c.details, rules),
+  }));
+  trace.checks = instructionChecks(trace, { invented: outcome.invented, fromEmber: outcome.fromEmber }, picks, rules);
+  const liked = taste.ratings.filter((r) => r.rating === 'like').length;
+  return saveRound(env, party, picks, trace,
+    { kids: rules.kids, adultsOnly: rules.adultsOnly, services: rules.services.length, taste: true },
+    { taste: { liked, disliked: taste.ratings.length - liked, unseen: taste.unseen.length, genres: party.members[0].answers.genres }, reserve: outcome.reserve, dismissed: [] },
+    ctx);
+}
+
+// POST /api/party/:id/replace  { mid, round, filmId }
+// "Not for me" on one result: that card is swapped for the next best match.
+// Free: no round is used and Ember is not called.
+async function handleReplace(request, env, id) {
+  const body = await request.json().catch(() => null);
+  if (!body) return json({ error: 'bad-request' }, 400);
+  const party = await loadParty(env, id);
+  if (!party) return json({ error: 'not-found' }, 404);
+  if (!party.solo || body.mid !== party.hostMid) return json({ error: 'solo-only' }, 403);
+  const n = Number(body.round);
+  if (n !== party.round || n < 1) return json({ error: 'bad-round' }, 400);
+  const round = await env.USAGE.get(roundKey(party.id, n), 'json');
+  if (!round || !round.reserve) return json({ error: 'bad-round' }, 400);
+  const at = round.picks.findIndex((p) => p.id === String(body.filmId));
+  if (at < 0) return json({ error: 'not-in-round' }, 404);
+
+  const rules = tasteRules(party);
+  const others = round.picks.filter((_, i) => i !== at).map((p) => ({ genre: p.primaryGenre }));
+  const genreCount = (party.members[0].answers.genres || []).length;
+  round.dismissed = [...(round.dismissed || []), round.picks[at].id];
+  let replacement = null;
+  while (!replacement) {
+    const [next] = takeVaried(round.reserve, 1, genreCount, others);
+    if (!next) break;
+    round.reserve = round.reserve.filter((c) => c.id !== next.id);
+    const details = await filmDetails(env, next.id).catch(() => null);
+    if (details) replacement = shapePick(details, party, tasteExtra(next, details, rules));
+  }
+  if (!replacement) {
+    await env.USAGE.put(roundKey(party.id, n), JSON.stringify(round), { expirationTtl: LOG_TTL });
+    return json({ error: 'no-more' }, 404);
+  }
+  round.picks[at] = replacement;
+  delete round.shareId; // the three changed: the next share is a new snapshot
+  await env.USAGE.put(roundKey(party.id, n), JSON.stringify(round), { expirationTtl: LOG_TTL });
+  return json({ party: await partyState(env, party, body.mid) });
 }
 
 // A round that produced nothing may still have cost money. Count it against
@@ -1279,6 +1708,91 @@ async function handleVotes(request, env, id) {
   }));
   await env.USAGE.put(votesKey(party.id, n, body.mid), JSON.stringify({ at: new Date().toISOString(), votes }), { expirationTtl: LOG_TTL });
   return json({ party: await partyState(env, party, body.mid) });
+}
+
+
+// ---------------------------------------------------------------------------
+// Sharing (Just me): a read-only snapshot of one round's three films
+// ---------------------------------------------------------------------------
+
+const shareKey = (id) => `share:${id}`;
+const MAX_SHARES_PER_DAY = 30;
+
+// POST /api/party/:id/share  { mid, round }
+// Free: no round, no Ember. Keeps only what the shared page shows: the
+// sharer's first name, their genres and the three films.
+async function handleShare(request, env, id) {
+  const body = await request.json().catch(() => null);
+  if (!body) return json({ error: 'bad-request' }, 400);
+  const party = await loadParty(env, id);
+  if (!party) return json({ error: 'not-found' }, 404);
+  if (!party.solo || body.mid !== party.hostMid) return json({ error: 'solo-only' }, 403);
+  const n = Number(body.round);
+  if (!Number.isInteger(n) || n < 1 || n > party.round) return json({ error: 'bad-round' }, 400);
+  const round = await env.USAGE.get(roundKey(party.id, n), 'json');
+  if (!round) return json({ error: 'bad-round' }, 400);
+  if (round.shareId) return json({ id: round.shareId, url: `/s/${round.shareId}` });
+
+  const { key } = await visitorKey(request, env);
+  const record = await readRecord(env, key);
+  if ((record.shares || 0) >= MAX_SHARES_PER_DAY) return json({ error: 'slow-down' }, 429);
+  record.shares = (record.shares || 0) + 1;
+
+  const me = party.members[0];
+  const shareId = randomId(8);
+  const snapshot = {
+    name: firstName(me.name),
+    genres: (me.answers.genres || []).slice(0, MAX_GENRES),
+    createdAt: new Date().toISOString(),
+    picks: round.picks.slice(0, 3).map((p) => ({
+      title: p.title, meta: p.meta, minutes: p.minutes, backdrop: p.backdrop || '', poster: p.poster || '',
+      primaryGenre: p.primaryGenre || '', becauseTitle: p.becauseTitle || '', popularIn: p.popularIn || '',
+      why: p.byEmber ? p.why : '', service: p.service || null, watchUrl: p.watchUrl || '',
+    })),
+  };
+  round.shareId = shareId;
+  await Promise.all([
+    env.USAGE.put(shareKey(shareId), JSON.stringify(snapshot), { expirationTtl: LOG_TTL }),
+    env.USAGE.put(roundKey(party.id, n), JSON.stringify(round), { expirationTtl: LOG_TTL }),
+    writeRecord(env, key, record),
+  ]);
+  return json({ id: shareId, url: `/s/${shareId}` });
+}
+
+async function loadShare(env, id) {
+  return validId(id, 8) ? env.USAGE.get(shareKey(id), 'json') : null;
+}
+
+// GET /api/share/:id
+async function handleGetShare(env, id) {
+  const share = await loadShare(env, id);
+  if (!share) return json({ error: 'gone' }, 404);
+  return json({ share }, 200, { 'Cache-Control': 'public, max-age=300' });
+}
+
+const escHtml = (text) => String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// GET /s/:id  the site's page, with link-preview tags for chat apps.
+async function handleSharePage(request, env, id) {
+  const page = await env.ASSETS.fetch(new Request(new URL('/index.html', request.url), { headers: request.headers }));
+  const share = await loadShare(env, id).catch(() => null);
+  // The page links its files relatively (styles.css, app.js): resolve them from the root.
+  const html = (await page.text()).replace('<head>', '<head>\n  <base href="/">');
+  if (!share) return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  const who = share.name ? `${share.name}'s` : 'My';
+  const titles = share.picks.map((p) => p.title).join(', ');
+  const image = (share.picks.find((p) => p.backdrop) || {}).backdrop || '';
+  const tags = [
+    ['og:title', `${who} three for tonight: ${titles}`],
+    ['og:description', `Picked by Movie Buddy from the films ${share.name || 'they'} liked. Get your own three in about a minute.`],
+    ['og:type', 'website'],
+    ['og:url', new URL(`/s/${id}`, request.url).href],
+    ...(image ? [['og:image', image]] : []),
+  ].map(([property, content]) => `<meta property="${property}" content="${escHtml(content)}">`);
+  tags.push(`<meta name="twitter:card" content="${image ? 'summary_large_image' : 'summary'}">`);
+  return new Response(html.replace('</head>', `${tags.join('\n  ')}\n</head>`), {
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' },
+  });
 }
 
 async function handleProviders(env) {
@@ -1393,6 +1907,9 @@ export default {
     const url = new URL(request.url);
 
     // Everything that is not the API is the static site.
+    // A shared three: the page, with link-preview tags.
+    const shared = url.pathname.match(/^\/s\/([a-z0-9]{8})\/?$/);
+    if (shared && request.method === 'GET') return handleSharePage(request, env, shared[1]);
     if (!url.pathname.startsWith('/api/')) return env.ASSETS.fetch(request);
 
     // 1. same-origin check
@@ -1410,18 +1927,23 @@ export default {
       if (route === 'POST /api/party') return await handleCreateParty(request, env);
       if (route === 'GET /api/providers') return await handleProviders(env);
       if (route === 'GET /api/posters') return await handlePosters(env);
+      if (route === 'GET /api/rate-films') return await handleRateFilms(env, url);
+      const shareGet = url.pathname.match(/^\/api\/share\/([a-z0-9]{8})$/);
+      if (shareGet && request.method === 'GET') return await handleGetShare(env, shareGet[1]);
       if (route === 'GET /api/wall') return await handleWall(env);
       if (route === 'GET /api/usage') return await handleUsage(request, env);
       if (route === 'GET /api/admin/trace') return await handleTrace(request, env);
       if (route === 'POST /api/usage/request') return await handleUsageRequest(request, env);
 
-      const party = url.pathname.match(/^\/api\/party\/([a-z0-9]+)(\/(join|round|votes))?$/);
+      const party = url.pathname.match(/^\/api\/party\/([a-z0-9]+)(\/(join|round|votes|replace|share))?$/);
       if (party) {
         const [, id, , action] = party;
         if (request.method === 'GET' && !action) return await handleGetParty(env, id, url.searchParams.get('mid') || '');
         if (request.method === 'POST' && action === 'join') return await handleJoin(request, env, id);
         if (request.method === 'POST' && action === 'round') return await handleRound(request, env, id);
         if (request.method === 'POST' && action === 'votes') return await handleVotes(request, env, id);
+        if (request.method === 'POST' && action === 'replace') return await handleReplace(request, env, id);
+        if (request.method === 'POST' && action === 'share') return await handleShare(request, env, id);
       }
       return json({ error: 'not-found' }, 404);
     } catch (err) {

@@ -36,7 +36,7 @@ const state = (e, id, mid) => call(e, `/api/party/${id}?mid=${mid}`).then((r) =>
 const tools = () => calls.ember.filter((b) => b.tools).length;
 
 async function test(name, fn) {
-  Object.assign(mock, { ember: 'good', discoverCount: 20, turnstileOk: true, runtime: 103, recentCount: null, tmdbFlaky: 0, brokenFilms: null });
+  Object.assign(mock, { ember: 'good', discoverCount: 20, turnstileOk: true, runtime: 103, recentCount: null, tmdbFlaky: 0, brokenFilms: null, film: null, thinVotes: 0 });
   calls.tmdb.length = 0; calls.ember.length = 0; calls.turnstile.length = 0;
   await fn(); passed += 1; console.log('ok  ', name);
 }
@@ -66,7 +66,7 @@ await test('solo round: the agent searches, then answers with three real films',
   // Three calls of 900 tokens in and 100 out, at $0.10 and $0.50 per million.
   assert.equal(data.round.costUsd, 0.00042);
   assert.equal(data.usage.costUsd, 0.00042);
-  assert.deepEqual(data.party.cost, { usd: 0.00042, tokens: 3000, calls: 3, searches: 1, estimated: false, agent: true, random: false });
+  assert.deepEqual(data.party.cost, { usd: 0.00042, tokens: 3000, calls: 3, searches: 1, estimated: false, agent: true, random: false, taste: false });
 });
 
 await test('Meta request format: tools with auto choice, then a schema-only final call', async () => {
@@ -578,6 +578,250 @@ await test('providers come from TMDB in priority order; the site itself is serve
   const page = await worker.fetch(req('/'), e);
   assert.match(await page.text(), /Movie Buddy/);
   assert.equal((await call(e, '/api/nope')).status, 404);
+});
+
+// ---------------------------------------------------------------- Just me: rate films, then recommend
+
+// A solo party and a taste round. Ratings carry the film's attributes (f),
+// as the page sends them back from /api/rate-films.
+async function soloParty(e, extra = {}) {
+  const { data } = await post(e, '/api/party', { mid: HOST, name: 'Gbenga', answers: { genres: ['thriller'], services: [8] }, solo: true, ...extra });
+  return data.party.id;
+}
+const rated = (filmId, rating, f, title = `Rated ${filmId}`) => ({ filmId, title, genre: 'thriller', rating, f: { g: [53], k: [], d: [], c: [], e: null, ...f } });
+const tasteRound = (e, id, taste) => round(e, id, { taste: { ratings: [], unseen: [], dismissed: [], ...taste } });
+const subrequests = () => calls.tmdb.length + calls.ember.length;
+
+await test('rate-films: about ten well-known films per genre, none twice, with what taste needs', async () => {
+  const e = env();
+  const { status, data } = await call(e, '/api/rate-films?genres=thriller,comedy');
+  assert.equal(status, 200);
+  assert.deepEqual(Object.keys(data.films), ['thriller', 'comedy'], 'genres in the order picked');
+  const all = [...data.films.thriller, ...data.films.comedy];
+  assert.equal(data.films.thriller.length, 10);
+  assert.equal(data.films.comedy.length, 10);
+  assert.equal(new Set(all.map((f) => f.id)).size, 20, 'no film in two genres');
+  const f = all[0];
+  for (const field of ['id', 'title', 'year', 'runtime', 'certification', 'poster', 'overview', 'genre']) assert.ok(f[field], field);
+  assert.ok(f.f.k.length && f.f.d.length && f.f.c.length && f.f.g.length && f.f.e);
+  const q = new URL('https://x' + calls.tmdb.find((c) => c.startsWith('/3/discover'))).searchParams;
+  assert.equal(q.get('sort_by'), 'vote_count.desc', 'well known: most voted');
+  assert.ok(subrequests() < 50, `subrequests ${subrequests()}`);
+  assert.equal((await call(e, '/api/rate-films?genres=nope')).status, 400);
+});
+
+await test('rate-films: a thin genre (few well-known films) lowers the vote bar; rating more moves past films shown', async () => {
+  const e = env();
+  mock.thinVotes = 2000; // like documentaries: one film with 2000+ votes
+  const { data } = await call(e, '/api/rate-films?genres=documentary');
+  assert.equal(data.films.documentary.length, 10);
+  const bars = calls.tmdb.filter((c) => c.startsWith('/3/discover')).map((c) => new URL('https://x' + c).searchParams.get('vote_count.gte'));
+  assert.deepEqual([...new Set(bars)], ['2000', '300']);
+  calls.tmdb.length = 0;
+  mock.thinVotes = 0;
+  const shown = data.films.documentary.map((f) => f.id);
+  const more = await call(e, `/api/rate-films?genres=documentary&exclude=${shown.join(',')}`);
+  assert.equal(more.data.films.documentary.length, 10);
+  assert.ok(more.data.films.documentary.every((f) => !shown.includes(f.id)));
+  assert.ok(calls.tmdb.filter((c) => c.startsWith('/3/discover')).length <= 5);
+});
+
+await test('taste round: liked attributes pull a film up, disliked ones push it down, with the reason', async () => {
+  const e = env();
+  // Film 115 shares the liked film's director and a keyword; 116 shares the disliked film's.
+  mock.film = (id) => (id === 115 ? { credits: { crew: [{ id: 777, job: 'Director' }], cast: [] }, keywords: { keywords: [{ id: 55 }] } }
+    : id === 116 ? { credits: { crew: [{ id: 888, job: 'Director' }], cast: [] }, keywords: { keywords: [{ id: 66 }] } } : {});
+  const id = await soloParty(e);
+  const { status, data } = await tasteRound(e, id, { ratings: [
+    rated(900, 'like', { d: [777], k: [55] }, 'Liked A'),
+    rated(901, 'like', { k: [12345] }, 'Liked B'),
+    rated(902, 'dislike', { d: [888], k: [66] }, 'Disliked C'),
+  ] });
+  assert.equal(status, 200);
+  const picks = data.party.picks;
+  assert.equal(data.party.justMe, true);
+  assert.equal(picks.length, 3);
+  assert.equal(picks[0].id, '115');
+  assert.equal(picks[0].becauseId, '900');
+  assert.equal(picks[0].becauseTitle, 'Liked A');
+  assert.ok(!picks.some((p) => p.id === '116'), 'look-alike of a disliked film is not shown');
+  assert.ok(picks.every((p) => p.byEmber && p.why && p.backdrop && p.service.name === 'Netflix' && p.watchUrl && p.primaryGenre === 'thriller'));
+  const brief = JSON.parse(calls.ember[0].messages[1].content);
+  assert.ok(brief.shortlist.length <= 10);
+  assert.deepEqual(brief.liked, ['Liked A', 'Liked B']);
+  assert.deepEqual(brief.not_for_me, ['Disliked C']);
+  assert.equal(calls.ember.length, 1);
+  assert.ok(!calls.ember[0].tools);
+  assert.equal(data.party.cost.taste, true);
+  assert.ok(subrequests() < 50, `subrequests ${subrequests()}`);
+  const stored = JSON.parse(e.USAGE.map.get(`p:${id}:r:1`));
+  assert.equal(stored.rules.taste, true);
+  assert.equal(stored.taste.liked, 2);
+  assert.ok(stored.reserve.length > 0);
+});
+
+await test('taste round: films rated, swapped away or dismissed are never recommended', async () => {
+  const e = env();
+  const id = await soloParty(e);
+  const { data } = await tasteRound(e, id, { ratings: [rated(101, 'like', { k: [5101] })], unseen: [102, 103], dismissed: [104] });
+  const brief = JSON.parse(calls.ember[0].messages[1].content);
+  const offered = brief.shortlist.map((c) => c.id);
+  [101, 102, 103, 104].forEach((n) => assert.ok(!offered.includes(n), `${n} offered`));
+  assert.ok(data.party.picks.every((p) => !['101', '102', '103', '104'].includes(p.id)));
+});
+
+await test('taste round: only films on your services; kids get G or PG only; adults no family films', async () => {
+  const e = env();
+  // Even films are on a service the person does not have; 111 is rated G.
+  mock.film = (id) => ({
+    ...(id % 2 === 0 ? { 'watch/providers': { results: { US: { flatrate: [{ provider_id: 337, provider_name: 'Disney Plus' }] } } } } : {}),
+    ...(id === 111 || id === 113 ? { release_dates: { results: [{ iso_3166_1: 'US', release_dates: [{ certification: id === 111 ? 'G' : 'PG' }] }] } } : {}),
+  });
+  const adults = await tasteRound(e, await soloParty(e), { ratings: [rated(900, 'like', {})] });
+  assert.ok(adults.data.party.picks.every((p) => Number(p.id) % 2 === 1), 'all on Netflix');
+  const discover = calls.tmdb.filter((c) => c.startsWith('/3/discover')).map((c) => new URL('https://x' + c).searchParams);
+  assert.ok(discover.every((q) => q.get('without_genres') === '10751' && q.get('with_watch_providers') === '8' && !q.get('with_runtime.lte')));
+  calls.tmdb.length = 0;
+  const kids = await tasteRound(e, await soloParty(e, { kids: true }), { ratings: [rated(900, 'like', {})] });
+  assert.deepEqual(kids.data.party.picks.map((p) => p.id).sort(), ['111', '113'], 'only the G and PG films, fewer than three');
+  assert.ok(calls.tmdb.filter((c) => c.startsWith('/3/discover')).every((c) => new URL('https://x' + c).searchParams.get('certification') === 'G|PG'));
+});
+
+await test('taste round: two genres picked, no more than two picks from one genre', async () => {
+  const e = env();
+  const id = await soloParty(e, { answers: { genres: ['thriller', 'comedy'], services: [8] } });
+  const { data } = await tasteRound(e, id, { ratings: [rated(900, 'like', { k: [5101, 5102, 5103, 5104] })] });
+  const genres = data.party.picks.map((p) => p.primaryGenre);
+  assert.equal(genres.length, 3);
+  assert.ok(genres.filter((g) => g === 'thriller').length <= 2 && genres.includes('comedy'), genres.join());
+});
+
+await test('taste round: Ember cannot invent films, and Ember down still gives the three best matches', async () => {
+  const e = env();
+  mock.ember = 'bad-ids';
+  const { data } = await tasteRound(e, await soloParty(e), { ratings: [rated(900, 'like', {})] });
+  assert.equal(data.party.picks.length, 3);
+  assert.ok(!data.party.picks.some((p) => p.id === '999999'));
+  assert.equal(data.round.checks.no_invented_films, false);
+  mock.ember = 'down';
+  const down = await tasteRound(e, await soloParty(e), { ratings: [rated(900, 'like', {})] });
+  assert.equal(down.status, 200);
+  assert.equal(down.data.party.picks.length, 3);
+  assert.ok(down.data.party.picks.every((p) => !p.byEmber && p.becauseTitle));
+});
+
+await test('taste round: nothing liked gives popular picks, labelled as such', async () => {
+  const e = env();
+  const { data } = await tasteRound(e, await soloParty(e), { ratings: [rated(900, 'dislike', {}), rated(901, 'dislike', {})] });
+  assert.equal(data.party.picks.length, 3);
+  assert.ok(data.party.picks.every((p) => p.popularIn === 'thriller' && !p.becauseTitle));
+});
+
+await test('replace: "Not for me" swaps only that card, free, until the matches run out', async () => {
+  const e = env();
+  mock.discoverCount = 3; // few matches: three picks and a short reserve
+  const id = await soloParty(e);
+  const first = await tasteRound(e, id, { ratings: [rated(900, 'like', {})] });
+  const before = first.data.party.picks.map((p) => p.id);
+  const used = first.data.usage.used;
+  calls.ember.length = 0;
+  const swapped = await post(e, `/api/party/${id}/replace`, { mid: HOST, round: 1, filmId: before[1] });
+  assert.equal(swapped.status, 200);
+  const after = swapped.data.party.picks.map((p) => p.id);
+  assert.equal(after[0], before[0]);
+  assert.equal(after[2], before[2]);
+  assert.notEqual(after[1], before[1]);
+  assert.ok(swapped.data.party.picks[1].becauseTitle);
+  assert.equal(calls.ember.length, 0, 'no Ember call');
+  assert.equal((await call(e, '/api/usage')).data.usage.used, used, 'no round used');
+  let status = 200;
+  for (let i = 0; i < 10 && status === 200; i += 1) {
+    ({ status } = await post(e, `/api/party/${id}/replace`, { mid: HOST, round: 1, filmId: (await state(e, id, HOST)).picks[0].id }));
+  }
+  assert.equal(status, 404, 'no-more once the reserve is used up');
+  assert.equal((await post(e, `/api/party/${await party(e)}/replace`, { mid: HOST, round: 1, filmId: '1' })).status, 403, 'groups cannot replace');
+});
+
+await test('Just me: no mood or time is needed, no runtime cap applies, and nobody can join', async () => {
+  const e = env();
+  mock.runtime = 200;
+  const id = await soloParty(e);
+  const { status, data } = await tasteRound(e, id, { ratings: [rated(900, 'like', {})] });
+  assert.equal(status, 200);
+  assert.equal(data.party.picks.length, 3, 'long films are fine: time is not asked');
+  assert.equal((await post(e, `/api/party/${id}/join`, { mid: DANA, name: 'Dana', answers: hostAnswers })).status, 409);
+});
+
+// ---------------------------------------------------------------- Just me: sharing
+
+await test('share: a read-only snapshot of the three, free, with no personal details beyond a first name', async () => {
+  const e = env();
+  const id = await soloParty(e, { name: 'Gbenga Ade' });
+  const first = await tasteRound(e, id, { ratings: [rated(900, 'like', {}, 'Liked A')] });
+  const used = first.data.usage.used;
+  calls.ember.length = 0;
+  const made = await post(e, `/api/party/${id}/share`, { mid: HOST, round: 1 });
+  assert.equal(made.status, 200);
+  assert.match(made.data.url, /^\/s\/[a-z0-9]{8}$/);
+  const again = await post(e, `/api/party/${id}/share`, { mid: HOST, round: 1 });
+  assert.equal(again.data.id, made.data.id, 'same round, same link');
+  const { status, data } = await call(e, `/api/share/${made.data.id}`);
+  assert.equal(status, 200);
+  assert.equal(data.share.name, 'Gbenga');
+  assert.deepEqual(data.share.genres, ['thriller']);
+  assert.equal(data.share.picks.length, 3);
+  assert.ok(data.share.picks.every((p) => p.title && p.becauseTitle === 'Liked A' && p.watchUrl && p.backdrop));
+  const text = JSON.stringify(data.share);
+  assert.ok(!text.includes(HOST) && !text.includes('place') && !text.includes('mid'), 'no ids or places');
+  assert.equal(calls.ember.length, 0);
+  assert.equal((await call(e, '/api/usage')).data.usage.used, used, 'no round used');
+  assert.equal((await call(e, '/api/share/zzzzzzzz')).status, 404);
+});
+
+await test('share: only the owner of a Just me round, and a swap makes a new snapshot', async () => {
+  const e = env();
+  const id = await soloParty(e);
+  await tasteRound(e, id, { ratings: [rated(900, 'like', {})] });
+  assert.equal((await post(e, `/api/party/${id}/share`, { mid: DANA, round: 1 })).status, 403);
+  assert.equal((await post(e, `/api/party/${id}/share`, { mid: HOST, round: 2 })).status, 400);
+  const group = await party(e);
+  await round(e, group);
+  assert.equal((await post(e, `/api/party/${group}/share`, { mid: HOST, round: 1 })).status, 403);
+  const before = (await post(e, `/api/party/${id}/share`, { mid: HOST, round: 1 })).data.id;
+  const picks = (await state(e, id, HOST)).picks;
+  await post(e, `/api/party/${id}/replace`, { mid: HOST, round: 1, filmId: picks[0].id });
+  const after = (await post(e, `/api/party/${id}/share`, { mid: HOST, round: 1 })).data.id;
+  assert.notEqual(after, before);
+  const titles = (await call(e, `/api/share/${after}`)).data.share.picks.map((p) => p.title);
+  assert.ok(!titles.includes(picks[0].title), 'the swapped-out film is not in the new snapshot');
+});
+
+await test('share page: /s/<id> is the site with link-preview tags; an unknown id is the plain page', async () => {
+  const e = env();
+  const id = await soloParty(e, { name: 'Dana "<b>"' });
+  await tasteRound(e, id, { ratings: [rated(900, 'like', {})] });
+  const shareId = (await post(e, `/api/party/${id}/share`, { mid: HOST, round: 1 })).data.id;
+  const page = await worker.fetch(req(`/s/${shareId}`), e);
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  assert.match(html, /<base href="\/">/);
+  assert.match(html, /<meta property="og:title" content="Dana&#39;s three for tonight: Film \d+, Film \d+, Film \d+">/);
+  assert.match(html, /<meta property="og:image" content="https:\/\/image\.tmdb\.org\/t\/p\/w780\/b\d+\.jpg">/);
+  assert.match(html, /summary_large_image/);
+  assert.match(html, /<script src="app\.js"><\/script>/);
+  const plain = await (await worker.fetch(req('/s/abcdefgh'), e)).text();
+  assert.ok(!plain.includes('og:title'));
+  assert.match(plain, /Movie Buddy/);
+});
+
+await test('share: at most 30 new links a day from one visitor', async () => {
+  const e = env();
+  const id = await soloParty(e);
+  await tasteRound(e, id, { ratings: [rated(900, 'like', {})] });
+  const key = [...e.USAGE.map.keys()].find((k) => k.startsWith('v:'));
+  const record = JSON.parse(e.USAGE.map.get(key));
+  e.USAGE.map.set(key, JSON.stringify({ ...record, shares: 30 }));
+  assert.equal((await post(e, `/api/party/${id}/share`, { mid: HOST, round: 1 })).status, 429);
 });
 
 console.log(`\n${passed} tests passed`);

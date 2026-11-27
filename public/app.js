@@ -48,7 +48,18 @@ const GENRES = [
   { id: 'music', label: 'Music' }, { id: 'war', label: 'War' }, { id: 'western', label: 'Western' },
 ];
 const MAX_GENRES = 3;
+
+// Just me: rate films, then recommend from what you liked.
+// The order of these steps is one list, so the kids question can move.
+const SOLO_STEPS = ['genres', 'rate', 'services', 'kids'];
+const RATE_PER_GENRE = 3; // films rated from each picked genre, per batch
+const MAX_SWAPS = 6; // "Haven't seen it" per genre before you rate what is shown
+
+const ICON_UP = '<svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10v11H4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1h3zm0 0 4-7a2 2 0 0 1 2 2v4h5.5a2 2 0 0 1 2 2.3l-1.2 7A2 2 0 0 1 17.3 21H7"/></svg>';
+const ICON_DOWN = '<svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><g transform="rotate(180 12 12)"><path d="M7 10v11H4a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1h3zm0 0 4-7a2 2 0 0 1 2 2v4h5.5a2 2 0 0 1 2 2.3l-1.2 7A2 2 0 0 1 17.3 21H7"/></g></svg>';
+const ICON_CHECK = '<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
 const GENRE_LABEL = Object.fromEntries(GENRES.map((g) => [g.id, g.label.toLowerCase()]));
+const GENRE_NAME = Object.fromEntries(GENRES.map((g) => [g.id, g.label]));
 const MOOD_FIRST = {
   lighter: ['comedy', 'romance', 'animation', 'family', 'adventure'],
   gripped: ['thriller', 'crime', 'mystery', 'action', 'horror'],
@@ -300,7 +311,27 @@ const state = {
   hostName: '',
   makeOwn: false, // home page: the "Pick your own" choices are open
   filmOpen: -1, // home page: which film tile has its details open (tap or click)
+  taste: null, // Just me: the films to rate and the ratings given (see newTaste)
+  shared: null, // a shared three opened from /s/<id>: { id, share } or { id, gone: true }
 };
+
+// Just me: everything the rating step keeps.
+function newTaste() {
+  return {
+    pools: {}, // genre -> films fetched to rate, in order
+    slots: [], // [{ genre, film, rating: 'like' | 'dislike' | null }] in the order shown
+    at: 0, // the slot being rated
+    swaps: {}, // genre -> "Haven't seen it" used
+    unseen: [], // films swapped away: never recommended back as new
+    dismissed: [], // results marked "Not for me"
+    noLikes: 0, // batches rated with nothing liked
+    more: false, // rating more from the results: go straight to a new round
+    loading: false,
+    error: '',
+    message: '',
+  };
+}
+state.taste = newTaste();
 
 function newId(length) {
   const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -314,19 +345,24 @@ function reset(screen, keepAddress) {
     screen, mode: 'solo', answers: { mood: '', genres: [], time: '', services: [] }, kids: false,
     partyId: '', mid: '', party: null, roundShown: 0, index: 0, votes: [],
     chosenId: null, share: null, hostName: '', askName: !profile.name, makeOwn: false, filmOpen: -1,
+    taste: newTaste(),
   });
-  // A returning visitor goes straight to the first real question.
-  if (screen === 'name' && !state.askName) state.screen = 'mood';
   if (location.hash && !keepAddress) history.replaceState(null, '', location.pathname + location.search);
+  // Leaving a shared page: back to the site's own address, so a reload does not reopen it.
+  if (/^\/s\//.test(location.pathname)) history.replaceState(null, '', '/');
 }
 
 // The questions each kind of visitor is asked, in order.
 function steps() {
   // The name is asked once per device. Sample mode has no server to send it to.
   const name = state.askName && !(sampleMode && state.mode === 'solo') ? ['name'] : [];
+  if (state.mode === 'solo') return [...name, ...SOLO_STEPS];
   const kids = state.mode === 'guest' ? [] : ['kids'];
   return [...name, 'mood', 'genres', 'time', 'services', ...kids];
 }
+
+// Just me: a round from the films rated (not the group's random picker).
+const justMe = () => !!state.party && !!state.party.justMe;
 
 const picks = () => (state.party ? state.party.picks : []);
 const currentPick = () => picks()[state.index];
@@ -429,7 +465,9 @@ function costLine() {
   const c = state.party && state.party.cost;
   if (!c || sampleMode) return '';
   if (!c.calls) return '<p class="cost small muted">This round used no Muse Ember calls.</p>';
-  const how = c.random
+  const how = c.taste
+    ? 'films scored against the ones you rated, the final three chosen by the agent'
+    : c.random
     ? 'three films drawn at random from your genres, explained by the agent'
     : c.agent
       ? `${c.searches} ${c.searches === 1 ? 'search' : 'searches'} by the agent`
@@ -639,8 +677,10 @@ function homeScreen() {
     </section>`;
 }
 function stepHeader() {
-  const list = steps();
-  return `<span class="small muted">${list.indexOf(state.screen) + 1} of ${list.length}</span>`;
+  // Just me numbers only the four real steps: the name, asked once, has no number.
+  const list = state.mode === 'solo' ? steps().filter((s) => s !== 'name') : steps();
+  if (!list.includes(state.screen)) return '';
+  return `<span class="small muted step-count">${list.indexOf(state.screen) + 1} of ${list.length}</span>`;
 }
 
 function stepFooter(nextLabel) {
@@ -696,9 +736,38 @@ function choiceScreen(title, hint, options, selected) {
 }
 
 const moodScreen = () => choiceScreen('How do you want to feel?', 'Pick the one closest to tonight.', MOODS, state.answers.mood);
+// Just me, step 1: one to three genres, three films to rate from each.
+function soloGenresScreen() {
+  const chosen = state.answers.genres;
+  const full = chosen.length >= MAX_GENRES;
+  const buttons = GENRES.map((g) => {
+    const on = chosen.includes(g.id);
+    return `<button type="button" class="chip" aria-pressed="${on}" data-action="toggle-genre" data-id="${esc(g.id)}"${full && !on ? ' disabled' : ''}>${on ? ICON_CHECK : ''}${esc(g.label)}</button>`;
+  }).join('');
+  const n = chosen.length;
+  const count = n ? `${n} of ${MAX_GENRES} picked · ${n * RATE_PER_GENRE} films to rate` : 'Pick at least 1';
+  return `
+    <section class="screen screen--wide">
+      <div class="stack">
+        ${stepHeader()}
+        <h1 class="title" tabindex="-1">What are you in the mood for?</h1>
+        <p class="muted" style="margin:0">Pick 1 to 3 genres. You'll rate three films from each, and we recommend from what you like.</p>
+      </div>
+      <div class="chips" role="group" aria-label="Genres">${buttons}</div>
+      <div class="row row--between">
+        <button type="button" class="link-button" data-action="back">Back</button>
+        <div class="row">
+          <span class="small muted" role="status">${count}</span>
+          <button type="button" class="button button--primary" data-action="next"${n ? '' : ' disabled'}>Continue</button>
+        </div>
+      </div>
+    </section>`;
+}
+
 // Optional, several allowed: the genres this person is in the mood for.
 // Those that suit the chosen mood are listed first.
 function genresScreen() {
+  if (state.mode === 'solo') return soloGenresScreen();
   const first = MOOD_FIRST[state.answers.mood] || [];
   const ordered = [...GENRES].sort((a, b) => (first.includes(a.id) ? first.indexOf(a.id) : 99) - (first.includes(b.id) ? first.indexOf(b.id) : 99));
   // Answers saved before genres existed have none.
@@ -744,7 +813,294 @@ function servicesScreen() {
 
 function kidsScreen() {
   const options = [{ id: 'no', label: 'No, adults only' }, { id: 'yes', label: 'Yes, keep it family-safe' }];
-  return choiceScreen('Any kids watching?', 'With kids, only films rated G or PG. Adults only leaves out family films unless someone picks that genre.', options, '');
+  const hint = state.mode === 'solo'
+    ? 'With kids, only films rated G or PG. Adults only leaves out family films unless you picked that genre.'
+    : 'With kids, only films rated G or PG. Adults only leaves out family films unless someone picks that genre.';
+  return choiceScreen('Any kids watching?', hint, options, '');
+}
+
+// ---------------------------------------------------------------------------
+// Just me: rate films (step 2) and the results
+// ---------------------------------------------------------------------------
+
+// Every film this person has been shown to rate, rated or swapped away.
+function tasteShownIds() {
+  const t = state.taste;
+  return [...new Set([...t.slots.filter((x) => x.film).map((x) => x.film.id), ...t.unseen])];
+}
+
+// The next film from a genre's pool that has not been shown yet.
+function nextRateFilm(genre) {
+  const shown = new Set(tasteShownIds());
+  return (state.taste.pools[genre] || []).find((f) => !shown.has(f.id)) || null;
+}
+
+// Fill every empty slot with a film, fetching more films when a genre's
+// pool is short. Ratings already given are never touched.
+async function fillRateSlots() {
+  const t = state.taste;
+  const short = [...new Set(t.slots.filter((x) => !x.film).map((x) => x.genre))].filter((g) => {
+    const empty = t.slots.filter((x) => x.genre === g && !x.film).length;
+    const shown = new Set(tasteShownIds());
+    return (t.pools[g] || []).filter((f) => !shown.has(f.id)).length < empty;
+  });
+  let answered = !short.length;
+  if (short.length) {
+    t.loading = true;
+    t.error = '';
+    if (state.screen === 'rate') render({ focus: false });
+    try {
+      if (sampleMode) throw new Error('no-server');
+      const pooled = Object.values(t.pools).flat().map((f) => f.id);
+      const exclude = [...new Set([...pooled, ...t.unseen])].join(',');
+      const { status, data } = await api(`/rate-films?genres=${encodeURIComponent(short.join(','))}&exclude=${exclude}`);
+      if (status !== 200) throw new Error(String(status));
+      Object.entries(data.films || {}).forEach(([g, films]) => {
+        const have = new Set((t.pools[g] || []).map((f) => f.id));
+        t.pools[g] = (t.pools[g] || []).concat(films.filter((f) => !have.has(f.id)));
+      });
+      answered = true;
+    } catch (err) {
+      t.error = sampleMode ? 'Rating films needs the live site.' : 'Could not load films to rate.';
+    }
+    t.loading = false;
+  }
+  t.slots.forEach((x) => { if (!x.film) x.film = nextRateFilm(x.genre); });
+  // TMDB answered but has no more films in a genre: rate fewer from it
+  // rather than stop on an error.
+  if (answered && t.slots.some((x) => !x.film)) {
+    const current = t.slots[t.at];
+    t.slots = t.slots.filter((x) => x.film);
+    const kept = t.slots.indexOf(current);
+    t.at = kept >= 0 ? kept : Math.max(0, Math.min(t.at, t.slots.length - 1));
+    if (!t.slots.length) t.error = 'No films to rate in those genres. Go back and pick others.';
+    else if (t.slots.every((x) => x.rating)) return finishRating();
+  }
+  if (state.screen === 'rate') render();
+}
+
+// Into step 2 from step 1: three slots for each picked genre, in the order
+// they were picked. Ratings for genres still picked are kept.
+function startRating() {
+  const t = state.taste;
+  const genres = state.answers.genres;
+  t.slots = t.slots.filter((x) => genres.includes(x.genre));
+  genres.forEach((g) => {
+    for (let i = t.slots.filter((x) => x.genre === g).length; i < RATE_PER_GENRE; i += 1) t.slots.push({ genre: g, film: null, rating: null });
+  });
+  t.slots.sort((a, b) => genres.indexOf(a.genre) - genres.indexOf(b.genre)); // stable: keeps each genre's order
+  const open = t.slots.findIndex((x) => !x.rating);
+  t.at = open < 0 ? 0 : open;
+  t.message = '';
+  state.screen = 'rate';
+  render();
+  return fillRateSlots();
+}
+
+// Three more films from each genre: after a batch with no likes, or "Rate more films".
+function addRateBatch() {
+  const t = state.taste;
+  const first = t.slots.length;
+  state.answers.genres.forEach((g) => {
+    for (let i = 0; i < RATE_PER_GENRE; i += 1) t.slots.push({ genre: g, film: null, rating: null });
+  });
+  t.slots = [...t.slots.slice(0, first), ...t.slots.slice(first).sort((a, b) => state.answers.genres.indexOf(a.genre) - state.answers.genres.indexOf(b.genre))];
+  t.at = first;
+  state.screen = 'rate';
+  render();
+  return fillRateSlots();
+}
+
+// The last film is rated: more films if nothing landed, otherwise on to
+// the services (or, rating more from the results, straight to a new round).
+function finishRating() {
+  const t = state.taste;
+  const liked = t.slots.some((x) => x.rating === 'like');
+  if (!liked && t.noLikes === 0) {
+    t.noLikes = 1;
+    t.message = 'Nothing landed yet. Try three more.';
+    return addRateBatch();
+  }
+  t.message = '';
+  if (t.more) {
+    t.more = false;
+    return newRound();
+  }
+  return goToStep(1);
+}
+
+function rateMeta(film) {
+  return [film.year, film.runtime, film.certification].filter(Boolean).join(' · ');
+}
+
+function rateScreen() {
+  const t = state.taste;
+  const slot = t.slots[t.at];
+  const genres = state.answers.genres;
+  const progress = genres.filter((g) => t.slots.some((x) => x.genre === g)).map((g) => {
+    const segs = t.slots.map((x, i) => {
+      if (x.genre !== g) return '';
+      const kind = i === t.at ? 'now' : x.rating || 'pending';
+      return `<span class="seg seg--${kind}"></span>`;
+    }).join('');
+    return `<div class="progress-group${slot && slot.genre === g ? ' is-now' : ''}"><span>${esc(GENRE_NAME[g] || g)}</span><div class="segs">${segs}</div></div>`;
+  }).join('');
+  const label = (x) => ({ like: 'liked', dislike: 'not for me' }[x.rating] || 'not rated yet');
+  const spoken = t.slots.map((x, i) => `Film ${i + 1}: ${label(x)}`).join('. ');
+
+  let card;
+  if (!slot && !t.loading && t.error) {
+    card = `<div class="film film--status" role="alert"><p>${esc(t.error)}</p><button type="button" class="button button--primary" data-action="rate-back">Pick other genres</button></div>`;
+  } else if (!slot || (!slot.film && t.loading)) {
+    card = '<div class="film film--status" role="status"><p class="muted">Finding films to rate…</p></div>';
+  } else if (!slot.film) {
+    card = `
+      <div class="film film--status" role="alert">
+        <p>${esc(t.error || 'Could not load films to rate.')}</p>
+        <button type="button" class="button button--primary" data-action="rate-retry">Try again</button>
+      </div>`;
+  } else {
+    const f = slot.film;
+    const canSwap = (t.swaps[slot.genre] || 0) < MAX_SWAPS && !!nextRateFilm(slot.genre);
+    const poster = f.poster
+      ? `<img class="film-poster" src="${esc(f.poster)}" alt="Poster for ${esc(f.title)}" width="200" height="300">`
+      : `<div class="film-poster poster-blank" aria-hidden="true"><span>${esc(f.title)}</span></div>`;
+    card = `
+      <div class="film">
+        ${poster}
+        <div class="film-body">
+          <span class="tag">${esc(GENRE_NAME[slot.genre] || slot.genre)}</span>
+          <h2>${esc(f.title)}</h2>
+          <span class="small muted">${esc(rateMeta(f))}</span>
+          <p class="film-overview">${esc(f.overview)}</p>
+          <div class="rate-actions">
+            <button type="button" class="button button--ghost" data-action="rate-dislike">${ICON_DOWN}Not for me</button>
+            <button type="button" class="button button--quiet" data-action="rate-unseen"${canSwap ? '' : ' disabled'}>Haven't seen it</button>
+            <button type="button" class="button button--primary" data-action="rate-like">${ICON_UP}Liked it</button>
+          </div>
+        </div>
+      </div>`;
+  }
+  return `
+    <section class="screen screen--rate">
+      <div class="stack">
+        ${stepHeader()}
+        <h1 class="title" tabindex="-1">Tell us what you like</h1>
+        <p class="muted" style="margin:0">Three films from each genre you picked. Haven't seen one? We swap in another.</p>
+      </div>
+      ${t.message ? `<p class="notice" role="status">${esc(t.message)}</p>` : ''}
+      <div class="rate-progress" role="img" aria-label="${esc(spoken)}">
+        ${progress}
+        <span class="small muted progress-count">Film ${Math.min(t.at + 1, t.slots.length)} of ${t.slots.length}</span>
+      </div>
+      ${card}
+      <div class="row row--between">
+        <button type="button" class="link-button" data-action="rate-back">Back</button>
+        <span class="small muted">Moves on by itself after the last film.</span>
+      </div>
+    </section>`;
+}
+
+function minutesText(minutes) {
+  return minutes ? `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m` : '';
+}
+
+// One recommended film. On a shared page the reason names the person who
+// shared it, Ember's line (written to them) is left out, and there is no
+// "Not for me".
+function recCard(p, shared) {
+  const service = (p.service && p.service.name) || (p.watch && p.watch.service) || '';
+  const url = p.watchUrl || (p.watch && p.watch.url) || '';
+  const meta = [GENRE_NAME[p.primaryGenre] || '', minutesText(p.minutes), service ? `on ${service}` : ''].filter(Boolean).join(' · ');
+  const who = shared ? (shared.name ? esc(shared.name) : 'they') : 'you';
+  const because = p.becauseTitle ? `Because ${who} liked ${esc(p.becauseTitle)}`
+    : p.popularIn ? `A popular pick in ${esc(GENRE_LABEL[p.popularIn] || p.popularIn)}` : '';
+  const art = p.backdrop
+    ? `<img class="rec-art" src="${esc(p.backdrop)}" alt="" width="780" height="439">`
+    : '<div class="rec-art poster-blank" aria-hidden="true"></div>';
+  return `
+      <article class="rec"${p.id ? ` id="rec-${esc(p.id)}"` : ''}>
+        ${art}
+        <div class="rec-body">
+          <h2 tabindex="-1">${esc(p.title)}</h2>
+          <span class="small muted">${esc(meta)}</span>
+          ${because ? `<p class="why">${ICON_UP}<span>${because}</span></p>` : ''}
+          ${!shared && p.byEmber && p.why ? `<p class="small muted rec-note">${esc(p.why)}</p>` : ''}
+          <div class="rec-actions">
+            ${url ? `<a class="button button--primary button--sm" href="${esc(url)}" target="_blank" rel="noopener">Watch${service ? ` on ${esc(service)}` : ''}</a>` : ''}
+            ${shared ? '' : `<button type="button" class="button button--ghost button--sm" data-action="dismiss-pick" data-id="${esc(p.id)}">Not for me</button>`}
+          </div>
+        </div>
+      </article>`;
+}
+
+// Just me: the three films, each with why it is here.
+function tasteResultsScreen() {
+  const all = picks();
+  const cards = all.map((p) => recCard(p, null)).join('');
+  const fewer = all.length < 3 ? `
+      <div class="next-round" role="status">
+        <p>Only ${all.length} ${all.length === 1 ? 'film' : 'films'} on your services matched. Adding a service widens the search.</p>
+        <div class="row"><button type="button" class="button" data-action="add-service">Add another service</button></div>
+      </div>` : '';
+  return `
+    <section class="screen screen--results">
+      <div class="stack">
+        <h1 class="title" tabindex="-1">Your three for <em>tonight.</em></h1>
+        <p class="muted" style="margin:0">Chosen from the films you liked, on the services you have. Each one says why it's here.</p>
+      </div>
+      <div class="recs">${cards}</div>
+      ${fewer}
+      <div class="row">
+        <button type="button" class="button button--primary button--sm" data-action="share-three">Share my three</button>
+        <button type="button" class="button button--ghost button--sm" data-action="rate-more">Rate more films</button>
+        <span class="small muted">None of these? Rating a few more sharpens the next three. "Not for me" swaps that film for another.</span>
+      </div>
+      ${state.share ? `${sharePanel()}<p class="small muted" style="margin:0">Shares your first name and these three films, nothing else.</p>` : ''}
+      ${costLine()}
+    </section>`;
+}
+
+// Someone's shared three, opened from /s/<id>: the films and why, then a
+// way to get your own.
+function sharedScreen() {
+  const s = state.shared;
+  const own = `
+      <section class="own">
+        <button type="button" class="own-button" data-action="own-from-share">Get your own three <span class="own-arrow" aria-hidden="true">→</span></button>
+      </section>
+      <div class="row"><button type="button" class="link-button" data-action="home">What is Movie Buddy?</button></div>`;
+  if (!s || s.gone) {
+    return `
+    <section class="screen screen--results">
+      <div class="stack">
+        <h1 class="title" tabindex="-1">This share has expired</h1>
+        <p class="muted" style="margin:0">Shared films are kept for 30 days. Rate a few films and Movie Buddy finds three for you, on the services you have.</p>
+      </div>
+      ${own}
+    </section>`;
+  }
+  const share = s.share;
+  const who = share.name ? `${esc(share.name)}'s` : 'Their';
+  return `
+    <section class="screen screen--results">
+      <div class="stack">
+        <h1 class="title" tabindex="-1">${who} three for <em>tonight.</em></h1>
+        <p class="muted" style="margin:0">Chosen by the Movie Buddy agent from films ${share.name ? esc(share.name) : 'they'} liked. Rate a few of your own and get three picked for you.</p>
+      </div>
+      <div class="recs">${share.picks.map((p) => recCard(p, share)).join('')}</div>
+      ${own}
+    </section>`;
+}
+
+// What the Worker needs to build the taste profile.
+function tastePayload() {
+  const t = state.taste;
+  return {
+    ratings: t.slots.filter((x) => x.film && x.rating).map((x) => ({ filmId: x.film.id, title: x.film.title, genre: x.genre, rating: x.rating, f: x.film.f })),
+    unseen: t.unseen,
+    dismissed: t.dismissed,
+  };
 }
 
 // While someone waits for the host to start a round: keep the page open, and
@@ -904,6 +1260,7 @@ function pickRow(p, line, canChoose) {
 }
 
 function resultsScreen() {
+  if (justMe()) return tasteResultsScreen();
   const p = state.party;
   const all = picks();
   const mine = new Set((p.yourVotes || []).filter((v) => v.vote === 'yes').map((v) => v.id));
@@ -1072,7 +1429,7 @@ function goneScreen() {
 
 const SCREENS = {
   home: homeScreen, name: nameScreen, mood: moodScreen, genres: genresScreen, time: timeScreen, services: servicesScreen,
-  kids: kidsScreen, lobby: lobbyScreen, loading: loadingScreen, deck: deckScreen, reason: reasonScreen,
+  kids: kidsScreen, rate: rateScreen, shared: sharedScreen, lobby: lobbyScreen, loading: loadingScreen, deck: deckScreen, reason: reasonScreen,
   results: resultsScreen, tonight: tonightScreen, usage: usageScreen, gone: goneScreen,
 };
 
@@ -1126,7 +1483,9 @@ function startPolling() {
 }
 
 function rememberParty() {
-  writeStore(PARTY_KEY, { id: state.partyId, mid: state.mid, name: state.name, answers: state.answers });
+  const t = state.taste;
+  const taste = state.mode === 'solo' ? { slots: t.slots.filter((x) => x.film && x.rating), unseen: t.unseen, dismissed: t.dismissed } : null;
+  writeStore(PARTY_KEY, { id: state.partyId, mid: state.mid, name: state.name, answers: state.answers, taste });
   history.replaceState(null, '', `${location.pathname}${location.search}#party-${state.partyId}`);
 }
 
@@ -1154,7 +1513,8 @@ function adoptParty(party, options) {
     state.index = 0;
     state.votes = [];
     state.chosenId = null;
-    state.screen = (party.inRound === false || party.yourVotes) ? 'results' : 'deck';
+    // Just me has no cards to swipe: the three films come with their reasons.
+    state.screen = (party.justMe || party.inRound === false || party.yourVotes) ? 'results' : 'deck';
     return render();
   }
   if (['usage', 'tonight', 'deck', 'reason', 'loading'].includes(state.screen)) return undefined; // do not interrupt
@@ -1189,7 +1549,7 @@ async function finishAnswers() {
       return adoptParty(data.party, { force: true });
     }
     state.mid = profile.id;
-    const { status, data } = await api('/party', { mid: state.mid, name: state.name, answers: state.answers, kids: state.kids, showOnWall: state.showMe });
+    const { status, data } = await api('/party', { mid: state.mid, name: state.name, answers: state.answers, kids: state.kids, showOnWall: state.showMe, solo: state.mode === 'solo' });
     if (status !== 200) { state.notice = 'Could not start. Try again in a minute.'; return render(); }
     state.partyId = data.party.id;
     state.party = data.party;
@@ -1220,18 +1580,26 @@ async function newRound() {
     return adoptParty({ ...state.party, round: state.roundShown + 1, picks: SAMPLE_PICKS, yourVotes: null, allVoted: false, results: null });
   }
 
-  const fail = (message) => { state.screen = state.party && state.party.round ? 'results' : cameFrom === 'home' ? 'home' : 'lobby'; state.notice = message; render(); };
+  // Just me goes back to the step it came from, ratings kept.
+  const soloBack = state.mode === 'solo' ? (state.party && state.party.round ? 'results' : 'kids') : null;
+  const fail = (message) => { state.screen = soloBack || (state.party && state.party.round ? 'results' : cameFrom === 'home' ? 'home' : 'lobby'); state.notice = message; render(); };
   try {
     const turnstileToken = await humanToken();
-    const { status, data } = await api(`/party/${state.partyId}/round`, { mid: state.mid, turnstileToken });
-    if (status === 200) { humanVerified = true; startPolling(); return adoptParty(data.party); }
-    state.screen = state.party && state.party.round ? 'results' : 'lobby';
+    const taste = state.mode === 'solo' ? { taste: tastePayload() } : {};
+    const { status, data } = await api(`/party/${state.partyId}/round`, { mid: state.mid, turnstileToken, ...taste });
+    if (status === 200) {
+      humanVerified = true;
+      if (state.mode === 'solo') rememberParty(); // keep the ratings with the round
+      startPolling();
+      return adoptParty(data.party);
+    }
+    state.screen = soloBack || (state.party && state.party.round ? 'results' : 'lobby');
     if (status === 429 && data.error === 'limit') return openUsage();
     if (status === 429 && data.error === 'busy') return openUsage('Movie Buddy has reached today\'s shared budget. It resets tomorrow.');
     if (status === 429 && data.error === 'budget') return openUsage('Movie Buddy has used its whole Muse Ember budget, so the agent is switched off.');
     if (status === 429) return fail('Too many requests. Wait a minute and try again.');
     if (data.error === 'human-check') return fail('We could not confirm you are a person. Reload the page and try again.');
-    if (data.error === 'no-matches') return fail('Nothing matched the whole group. Try adding more services.');
+    if (data.error === 'no-matches') return fail(state.mode === 'solo' ? 'Nothing on your services matched. Try adding another service.' : 'Nothing matched the whole group. Try adding more services.');
     return fail('Something went wrong getting your films. Try again.');
   } catch (err) {
     return fail('Could not reach Movie Buddy. Check your connection and try again.');
@@ -1267,7 +1635,11 @@ async function openParty(id) {
       state.mid = mid;
       state.name = (mine && mine.id === id && mine.name) || profile.name || '';
       state.answers = (mine && mine.id === id && mine.answers) || state.answers;
-      state.mode = data.party.isHost ? 'host' : 'guest';
+      state.mode = data.party.justMe ? 'solo' : data.party.isHost ? 'host' : 'guest';
+      if (data.party.justMe && mine && mine.taste) {
+        state.taste = { ...newTaste(), ...mine.taste, at: Math.max(0, mine.taste.slots.length - 1) };
+        state.taste.slots.forEach((x) => { (state.taste.pools[x.genre] = state.taste.pools[x.genre] || []).push(x.film); });
+      }
       if (data.party.isHost && !data.party.round) state.share = { url: inviteLink(), text: 'Help pick tonight\'s film. Add your mood and your streaming services:', note: '' };
       startPolling();
       return adoptParty(data.party, { force: true });
@@ -1301,6 +1673,12 @@ function goToStep(offset) {
     return render();
   }
   if (next >= list.length) return finishAnswers();
+  // Just me: going forward into the rating step loads its films; coming
+  // back to it lands on the last film rated, rating intact.
+  if (list[next] === 'rate') {
+    if (offset > 0) return startRating();
+    state.taste.at = Math.max(0, state.taste.slots.length - 1);
+  }
   state.screen = list[next];
   return render();
 }
@@ -1360,13 +1738,36 @@ async function nativeShare() {
   }
 }
 
+// Liked it / Not for me: record it and move to the next film, or on when
+// it was the last.
+function rateFilm(rating) {
+  const t = state.taste;
+  const slot = t.slots[t.at];
+  if (!slot || !slot.film) return undefined;
+  slot.rating = rating;
+  t.message = '';
+  if (t.at < t.slots.length - 1) {
+    t.at += 1;
+    render({ focus: false });
+    return focusRateButton(`rate-${rating}`);
+  }
+  return finishRating();
+}
+
+// After a re-render, keep keyboard focus on the button just used.
+function focusRateButton(action) {
+  const button = app.querySelector(`[data-action="${action}"]:not([disabled])`) || app.querySelector('[data-action="rate-like"]');
+  if (button) button.focus();
+}
+
 const ACTIONS = {
   home() { reset('home'); render(); loadWall().then(() => { if (state.screen === 'home') render({ focus: false }); }); },
-  'start-solo'() { reset(sampleMode ? 'mood' : 'name'); state.mode = 'solo'; render(); },
+  'start-solo'() { reset('home'); state.mode = 'solo'; state.screen = steps()[0]; render(); },
   'start-group'() {
     if (sampleMode) { state.notice = 'Groups need the live site. This preview is solo only.'; return render(); }
-    reset('name');
+    reset('home');
     state.mode = 'host';
+    state.screen = steps()[0];
     return render();
   },
   // Someone else is using this device: forget the name and start a new identity.
@@ -1418,6 +1819,77 @@ const ACTIONS = {
     render({ focus: false });
   },
   'new-round': newRound,
+  async 'share-three'() {
+    try {
+      const { status, data } = await api(`/party/${state.partyId}/share`, { mid: state.mid, round: state.roundShown });
+      if (status !== 200) throw new Error(String(status));
+      state.share = { url: `${SITE_URL || location.origin}${data.url}`, text: 'Send your three to a friend. They can see why each one is here, then get their own.', note: '' };
+    } catch (err) {
+      state.notice = 'Could not make a link. Try again.';
+    }
+    render({ focus: false });
+    const link = document.getElementById('share-link');
+    if (link) link.focus();
+  },
+  'own-from-share'() {
+    const genres = state.shared && state.shared.share ? state.shared.share.genres : [];
+    reset('home');
+    state.mode = 'solo';
+    state.answers.genres = (genres || []).filter((g) => GENRE_NAME[g]).slice(0, MAX_GENRES);
+    state.screen = steps()[0];
+    render();
+  },
+  'rate-like'() { rateFilm('like'); },
+  'rate-dislike'() { rateFilm('dislike'); },
+  'rate-unseen'() {
+    const t = state.taste;
+    const slot = t.slots[t.at];
+    if (!slot || !slot.film || (t.swaps[slot.genre] || 0) >= MAX_SWAPS) return;
+    const next = nextRateFilm(slot.genre);
+    if (!next) return;
+    t.unseen.push(slot.film.id);
+    t.swaps[slot.genre] = (t.swaps[slot.genre] || 0) + 1;
+    slot.film = next;
+    slot.rating = null;
+    render({ focus: false });
+    focusRateButton('rate-unseen');
+  },
+  'rate-back'() {
+    const t = state.taste;
+    if (t.at > 0) { t.at -= 1; render({ focus: false }); return focusRateButton('rate-like'); }
+    return goToStep(-1);
+  },
+  'rate-retry'() { fillRateSlots(); },
+  'rate-more'() {
+    if (usageNow().left < 1) return openUsage();
+    state.taste.more = true;
+    state.taste.message = '';
+    return addRateBatch();
+  },
+  'add-service'() { state.screen = 'services'; render(); },
+  async 'dismiss-pick'(id) {
+    if (!state.taste.dismissed.includes(Number(id))) state.taste.dismissed.push(Number(id));
+    try {
+      const { status, data } = await api(`/party/${state.partyId}/replace`, { mid: state.mid, round: state.roundShown, filmId: id });
+      if (status === 200) {
+        const at = picks().findIndex((p) => p.id === id);
+        state.party = data.party;
+        state.share = null; // the three changed: a new share makes a new link
+        render({ focus: false });
+        // Focus the card that replaced it, so keyboard users stay in place.
+        const replaced = picks()[at];
+        const heading = replaced && document.querySelector(`#rec-${CSS.escape(replaced.id)} h2`);
+        if (heading) heading.focus();
+        return undefined;
+      }
+      state.notice = data.error === 'no-more'
+        ? 'No other films on your services matched. Try "Rate more films" or add a service.'
+        : 'Could not swap that film. Try again.';
+    } catch (err) {
+      state.notice = 'Could not reach Movie Buddy. Check your connection and try again.';
+    }
+    return render({ focus: false });
+  },
   'vote-yes'() { vote('yes'); },
   'vote-no'() { vote('no'); },
   reason(id) { recordVote('no', id); },
@@ -1530,8 +2002,18 @@ async function start() {
   } catch (err) {
     sampleMode = true;
   }
+  const shared = location.pathname.match(/^\/s\/([a-z0-9]{8})\/?$/);
   const id = partyIdFromHash();
-  if (id) await openParty(id);
+  if (shared && !sampleMode) {
+    try {
+      const { status, data } = await api(`/share/${shared[1]}`);
+      state.shared = status === 200 ? { id: shared[1], share: data.share } : { id: shared[1], gone: true };
+    } catch (err) {
+      state.shared = { id: shared[1], gone: true };
+    }
+    state.screen = 'shared';
+    render();
+  } else if (id) await openParty(id);
   else render({ focus: false });
   loadWall().then(() => { if (state.screen === 'home') render({ focus: false }); });
   // Posters fill the home page's film tiles and the waiting screen.

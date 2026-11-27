@@ -52,7 +52,9 @@ export const calls = { tmdb: [], ember: [], turnstile: [] };
 //   bad-ids       final answer contains an invented film
 //   garbage       final answer is not JSON
 //   down          the API returns 500
-export const mock = { ember: 'good', discoverCount: 20, turnstileOk: true, runtime: 103, recentCount: null };
+export const mock = { ember: 'good', discoverCount: 20, turnstileOk: true, runtime: 103, recentCount: null, film: null, thinVotes: 0 };
+// mock.film: optional (id) => fields that override a film's details, for
+// taste tests: keywords, credits, certificate, services.
 
 function movie(id) {
   return { id, title: `Film ${id}`, release_date: '2019-05-01', genre_ids: [53, 80], vote_average: 7.1, poster_path: `/p${id}.jpg`, overview: `Film ${id} is a tense story about a heist that goes wrong. It keeps moving.` };
@@ -72,7 +74,7 @@ function emberReply(body) {
   const toolMessages = body.messages.filter((m) => m.role === 'tool');
   const films = toolMessages.flatMap((m) => { try { return JSON.parse(m.content).films || []; } catch (e) { return []; } });
   const brief = JSON.parse(body.messages[1].content);
-  const candidates = films.length ? films : (brief.films || []);
+  const candidates = films.length ? films : (brief.films || brief.shortlist || []);
 
   if (body.tools) { // a loop step
     if (mock.ember === 'no-tools') return { role: 'assistant', content: 'How about a comedy?' };
@@ -85,7 +87,7 @@ function emberReply(body) {
 
   // the final answer
   if (mock.ember === 'garbage') return { role: 'assistant', content: 'Sure! Here are some films you might like.' };
-  const labels = brief.people.map((p) => p.label);
+  const labels = (brief.people || []).map((p) => p.label);
   const picks = candidates.slice(0, 3).map((c, i) => ({ id: c.id, why: `You wanted something tense, and ${c.title} is a heist story that keeps moving.`, fits: i === 0 ? labels : labels.slice(0, 1) }));
   if (mock.ember === 'bad-ids') { picks[0] = { id: 999999, why: 'Invented.', fits: labels }; picks[1].fits = ['P1', 'P99']; }
   return { role: 'assistant', content: JSON.stringify({ picks }) };
@@ -109,8 +111,13 @@ export function installFetchMock() {
         if (mock.recentCount !== null && Number(url.searchParams.get('vote_count.gte')) >= 300) {
           return ok({ page, total_pages: 1, results: Array.from({ length: mock.recentCount }, (_, i) => movie(900 + i)) });
         }
-        const start = 100 + (page - 1) * 20;
-        return ok({ page, total_pages: 5, results: Array.from({ length: mock.discoverCount }, (_, i) => movie(start + i + 1)) });
+        // A thin genre: only one film has this many votes.
+        if (mock.thinVotes && Number(url.searchParams.get('vote_count.gte')) >= mock.thinVotes) {
+          return ok({ page, total_pages: 1, total_results: 1, results: [movie(990)] });
+        }
+        // Comedy searches return their own films, so two genres do not overlap.
+        const start = (url.searchParams.get('with_genres') === '35' ? 600 : 100) + (page - 1) * 20;
+        return ok({ page, total_pages: 5, total_results: 100, results: Array.from({ length: mock.discoverCount }, (_, i) => movie(start + i + 1)) });
       }
       if (url.pathname === '/3/movie/popular') return ok({ results: [...Array.from({ length: 20 }, (_, i) => movie(i + 1)), { id: 99, title: 'No poster', poster_path: null }] });
       if (url.pathname === '/3/watch/providers/movie') return ok({ results: [...PROVIDERS].reverse() });
@@ -121,6 +128,11 @@ export function installFetchMock() {
           ...movie(id), runtime: mock.runtime, genres: [{ id: 53, name: 'Thriller' }],
           'watch/providers': { results: { US: { link: `https://www.themoviedb.org/movie/${id}/watch`, flatrate: [PROVIDERS[0], PROVIDERS[2]] } } },
           videos: { results: [{ site: 'YouTube', type: 'Trailer', key: `yt${id}` }] },
+          keywords: { keywords: [{ id: 5000 + id, name: `kw${id}` }] },
+          credits: { crew: [{ id: 7000 + id, job: 'Director' }], cast: [{ id: 8000 + id }] },
+          release_dates: { results: [{ iso_3166_1: 'US', release_dates: [{ certification: 'PG-13' }] }] },
+          backdrop_path: `/b${id}.jpg`,
+          ...(mock.film ? mock.film(id) : null),
         });
       }
       return new Response('{}', { status: 404 });

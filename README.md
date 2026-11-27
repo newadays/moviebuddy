@@ -83,6 +83,58 @@ refused; with only the site key set, the check is shown but not enforced.
 
 ## How a round works
 
+There are two flows: **Just me**, which recommends from films you rate, and
+**Watch with friends**, which works from everyone's mood and genres.
+
+### Just me: rate films, then recommend (content-based filtering)
+
+Four steps, then the results:
+
+1. **Genres:** pick 1 to 3.
+2. **Rate films:** three well-known films from each genre (TMDB's most-voted,
+   any era, from `GET /api/rate-films`). Each one is *Liked it*, *Not for me*
+   or *Haven't seen it*. "Haven't seen it" swaps in another film, up to six
+   times per genre. If nothing is liked, three more per genre are shown; after
+   a second batch with nothing liked, the results are popular picks instead.
+3. **Services** and 4. **Kids**. Mood and time are not asked.
+
+Each rated film is described by its TMDB attributes, with these weights:
+genres 1, keywords 1.5, director 2, lead cast 1, decade 0.5. A like adds those
+weights to a taste profile and a dislike takes them away. Then:
+
+- **Candidates:** films in the picked genres released in the **last five
+  years**, on at least one of your services (US, included with the
+  subscription), with the age-group rules below. Films you rated, swapped away
+  or dismissed are never recommended.
+- **Score:** the sum of the profile's weights over a candidate's attributes,
+  divided by the square root of how many it has. The 32 most promising (shared
+  out between the genres) get a closer look: keywords, credits, certificate
+  and services.
+- **Ember chooses:** the ten best matches go to Muse Ember with the films you
+  liked and did not. It picks the three you are most likely to enjoy that
+  differ from each other, and writes one line on each. No more than two may
+  share a genre when you picked two or more. If Ember is down, the three best
+  scores are shown.
+- **Why it's here:** each card says "Because you liked *X*": the liked film
+  that shares the most with it.
+- **Not for me** on a result swaps that one card for the next best match
+  (`POST /api/party/:id/replace`). It is free: no round is used and Ember is
+  not called. **Rate more films** adds three films per genre, then gives a new
+  three (that uses a round).
+
+**Sharing.** *Share my three* on the results makes a read-only link,
+`/s/<id>` (`POST /api/party/:id/share`, free). It keeps only the sharer's
+first name, their genres and the three films, for 30 days. Whoever opens it
+sees the three with "Because *Segun* liked *X*" and a **Get your own three**
+button that starts Just me with the same genres picked. The page carries
+link-preview tags (title and the first film's backdrop), so it shows up as a
+card in chat apps.
+
+A round stays under Cloudflare's 50 outside requests: up to 6 searches, 32
+film details and one Ember call.
+
+### Watch with friends
+
 Everyone answers four questions: mood, genres (up to three, or skip), how long
 they have, and their streaming services. The host also says whether kids are
 watching.
@@ -114,7 +166,7 @@ drama pick", "A comedy pick for you and Segun").
 
 Set `PICKER` to `"agent"` to use the search agent described below instead.
 
-### The search agent (`PICKER: "agent"`)
+#### The search agent (`PICKER: "agent"`)
 
 1. The host asks for a round. The Worker gathers every member's answers and
    what the group already voted on.
