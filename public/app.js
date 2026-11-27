@@ -51,7 +51,7 @@ const MAX_GENRES = 3;
 
 // Just me: rate films, then recommend from what you liked.
 // The order of these steps is one list, so the kids question can move.
-const SOLO_STEPS = ['genres', 'rate', 'services', 'kids'];
+const SOLO_STEPS = ['kids', 'genres', 'rate', 'services'];
 const RATE_PER_GENRE = 3; // films rated from each picked genre, per batch
 const MAX_SWAPS = 6; // "Haven't seen it" per genre before you rate what is shown
 
@@ -297,6 +297,7 @@ const state = {
   askName: !profile.name, // false once this device has given a name
   answers: { mood: '', genres: [], time: '', services: [] },
   kids: false,
+  kidsChosen: false, // the kids question has been answered this time through
   partyId: '',
   mid: '',
   party: null, // the group as the server last described it
@@ -342,7 +343,7 @@ function newId(length) {
 function reset(screen, keepAddress) {
   stopPolling();
   Object.assign(state, {
-    screen, mode: 'solo', answers: { mood: '', genres: [], time: '', services: [] }, kids: false,
+    screen, mode: 'solo', answers: { mood: '', genres: [], time: '', services: [] }, kids: false, kidsChosen: false,
     partyId: '', mid: '', party: null, roundShown: 0, index: 0, votes: [],
     chosenId: null, share: null, hostName: '', askName: !profile.name, makeOwn: false, filmOpen: -1,
     taste: newTaste(),
@@ -357,8 +358,18 @@ function steps() {
   // The name is asked once per device. Sample mode has no server to send it to.
   const name = state.askName && !(sampleMode && state.mode === 'solo') ? ['name'] : [];
   if (state.mode === 'solo') return [...name, ...SOLO_STEPS];
+  // The host answers for the whole group; guests are told the answer.
   const kids = state.mode === 'guest' ? [] : ['kids'];
-  return [...name, 'mood', 'genres', 'time', 'services', ...kids];
+  return [...name, ...kids, 'mood', 'genres', 'time', 'services'];
+}
+
+// The kids answer. Films loaded or rated under the other answer are dropped,
+// and horror is never searched with kids, so it is unpicked.
+function setKids(kids) {
+  if (state.kidsChosen && state.kids !== kids) state.taste = newTaste();
+  state.kids = kids;
+  state.kidsChosen = true;
+  if (kids) state.answers.genres = (state.answers.genres || []).filter((g) => g !== 'horror');
 }
 
 // Just me: a round from the films rated (not the group's random picker).
@@ -735,12 +746,15 @@ function choiceScreen(title, hint, options, selected) {
     </section>`;
 }
 
+// The genres offered. With kids watching, horror is never searched, so it is not offered.
+const genreChoices = () => (state.kids ? GENRES.filter((g) => g.id !== 'horror') : GENRES);
+
 const moodScreen = () => choiceScreen('How do you want to feel?', 'Pick the one closest to tonight.', MOODS, state.answers.mood);
 // Just me, step 1: one to three genres, three films to rate from each.
 function soloGenresScreen() {
   const chosen = state.answers.genres;
   const full = chosen.length >= MAX_GENRES;
-  const buttons = GENRES.map((g) => {
+  const buttons = genreChoices().map((g) => {
     const on = chosen.includes(g.id);
     return `<button type="button" class="chip" aria-pressed="${on}" data-action="toggle-genre" data-id="${esc(g.id)}"${full && !on ? ' disabled' : ''}>${on ? ICON_CHECK : ''}${esc(g.label)}</button>`;
   }).join('');
@@ -769,7 +783,7 @@ function soloGenresScreen() {
 function genresScreen() {
   if (state.mode === 'solo') return soloGenresScreen();
   const first = MOOD_FIRST[state.answers.mood] || [];
-  const ordered = [...GENRES].sort((a, b) => (first.includes(a.id) ? first.indexOf(a.id) : 99) - (first.includes(b.id) ? first.indexOf(b.id) : 99));
+  const ordered = [...genreChoices()].sort((a, b) => (first.includes(a.id) ? first.indexOf(a.id) : 99) - (first.includes(b.id) ? first.indexOf(b.id) : 99));
   // Answers saved before genres existed have none.
   const chosen = state.answers.genres || (state.answers.genres = []);
   const full = chosen.length >= MAX_GENRES;
@@ -783,6 +797,7 @@ function genresScreen() {
         ${stepHeader()}
         <h1 class="title" tabindex="-1">Any genres in mind?</h1>
         <p class="muted" style="margin:0">Pick up to ${MAX_GENRES}, or skip and let the agent choose from your mood.</p>
+        ${state.mode === 'guest' && state.kids ? `<p class="small muted" style="margin:0">${esc(state.hostName || 'Your host')} set this group to family-safe: films rated G or PG.</p>` : ''}
       </div>
       <div class="chips" role="group" aria-label="Genres">${buttons}</div>
       <p class="small muted" style="margin:0" role="status">${chosen.length ? `${chosen.length} of ${MAX_GENRES} chosen` : ''}</p>
@@ -807,16 +822,17 @@ function servicesScreen() {
         <p class="muted" style="margin:0">Choose every service you subscribe to. ${state.mode === 'solo' ? 'The agent searches all of them at once.' : 'The agent searches everyone\'s subscriptions together.'}</p>
       </div>
       <div class="options options--grid">${buttons}</div>
-      ${stepFooter(isLast ? 'Join the group' : 'Continue')}
+      ${stepFooter(!isLast ? 'Continue' : state.mode === 'solo' ? 'Find my three' : state.mode === 'guest' ? 'Join the group' : 'Create the group')}
     </section>`;
 }
 
 function kidsScreen() {
   const options = [{ id: 'no', label: 'No, adults only' }, { id: 'yes', label: 'Yes, keep it family-safe' }];
   const hint = state.mode === 'solo'
-    ? 'With kids, only films rated G or PG. Adults only leaves out family films unless you picked that genre.'
-    : 'With kids, only films rated G or PG. Adults only leaves out family films unless someone picks that genre.';
-  return choiceScreen('Any kids watching?', hint, options, '');
+    ? 'With kids, every film is rated G or PG, including the ones you rate. Adults only leaves out family films unless you pick Family.'
+    : 'With kids, every film is rated G or PG. Adults only leaves out family films unless someone picks Family.';
+  const selected = state.kidsChosen ? (state.kids ? 'yes' : 'no') : '';
+  return choiceScreen('Any kids watching?', hint, options, selected);
 }
 
 // ---------------------------------------------------------------------------
@@ -853,7 +869,7 @@ async function fillRateSlots() {
       if (sampleMode) throw new Error('no-server');
       const pooled = Object.values(t.pools).flat().map((f) => f.id);
       const exclude = [...new Set([...pooled, ...t.unseen])].join(',');
-      const { status, data } = await api(`/rate-films?genres=${encodeURIComponent(short.join(','))}&exclude=${exclude}`);
+      const { status, data } = await api(`/rate-films?genres=${encodeURIComponent(short.join(','))}&exclude=${exclude}${state.kids ? '&kids=1' : ''}`);
       if (status !== 200) throw new Error(String(status));
       Object.entries(data.films || {}).forEach(([g, films]) => {
         const have = new Set((t.pools[g] || []).map((f) => f.id));
@@ -1581,7 +1597,7 @@ async function newRound() {
   }
 
   // Just me goes back to the step it came from, ratings kept.
-  const soloBack = state.mode === 'solo' ? (state.party && state.party.round ? 'results' : 'kids') : null;
+  const soloBack = state.mode === 'solo' ? (state.party && state.party.round ? 'results' : 'services') : null;
   const fail = (message) => { state.screen = soloBack || (state.party && state.party.round ? 'results' : cameFrom === 'home' ? 'home' : 'lobby'); state.notice = message; render(); };
   try {
     const turnstileToken = await humanToken();
@@ -1648,6 +1664,7 @@ async function openParty(id) {
     state.mode = 'guest';
     state.mid = profile.id;
     state.hostName = data.party.hostName;
+    state.kids = data.party.kids === true;
     state.askName = !profile.name;
     state.screen = steps()[0];
     if (!state.askName) state.notice = `${state.hostName || 'A friend'} invited you to pick a film together, ${profile.name}.`;
@@ -1800,7 +1817,7 @@ const ACTIONS = {
   back() { goToStep(-1); },
   next() { goToStep(1); },
   'choose-answer'(id) {
-    if (state.screen === 'kids') state.kids = id === 'yes';
+    if (state.screen === 'kids') setKids(id === 'yes');
     else state.answers[state.screen] = id;
     goToStep(1);
   },

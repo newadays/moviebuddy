@@ -1049,6 +1049,8 @@ async function handleRateFilms(env, url) {
   const genres = [...new Set(String(url.searchParams.get('genres') || '').split(',').map((g) => g.trim().toLowerCase()))]
     .filter((g) => GENRE_IDS[g]).slice(0, MAX_GENRES);
   if (!genres.length) return json({ error: 'bad-request' }, 400);
+  // Kids watching: only films rated G or PG to rate, never horror.
+  const kids = url.searchParams.get('kids') === '1';
   const used = new Set(String(url.searchParams.get('exclude') || '').split(',').map(Number).filter((n) => Number.isInteger(n) && n > 0).slice(0, 300));
 
   const picked = [];
@@ -1061,10 +1063,10 @@ async function handleRateFilms(env, url) {
     // few films with that many votes, so the bar is lowered until the genre
     // has enough. Then pages are read from a random start, moving on past
     // films already shown. At most five searches a genre.
-    const search = (votes, page) => tmdb(env, '/discover/movie', {
+    const search = (votes, page) => tmdb(env, '/discover/movie', ageFilter({
       with_genres: GENRE_IDS[genre], sort_by: 'vote_count.desc', 'vote_count.gte': votes,
       include_adult: 'false', include_video: 'false', language: 'en-US', page,
-    }, 86400).catch(() => null);
+    }, { kids }), 86400).catch(() => null);
     let calls = 0;
     let votes = RATE_VOTE_STEPS[0];
     let first = null;
@@ -1371,7 +1373,7 @@ async function partyState(env, party, mid) {
   if (!me) {
     // Not a member yet: just enough to show the join screen.
     const host = party.members.find((m) => m.mid === party.hostMid);
-    return { id: party.id, joined: false, hostName: host ? host.name : '', memberCount: party.members.length, full: party.members.length >= MAX_MEMBERS, started: party.round > 0 };
+    return { id: party.id, joined: false, hostName: host ? host.name : '', kids: !!party.kids, memberCount: party.members.length, full: party.members.length >= MAX_MEMBERS, started: party.round > 0 };
   }
 
   const names = Object.fromEntries(party.members.map((m) => [m.mid, m.name]));

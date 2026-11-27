@@ -90,13 +90,15 @@ There are two flows: **Just me**, which recommends from films you rate, and
 
 Four steps, then the results:
 
-1. **Genres:** pick 1 to 3.
-2. **Rate films:** three well-known films from each genre (TMDB's most-voted,
+1. **Kids watching?** Asked first, so every later step respects it: with
+   kids, Horror is not offered and the films to rate are rated G or PG.
+2. **Genres:** pick 1 to 3.
+3. **Rate films:** three well-known films from each genre (TMDB's most-voted,
    any era, from `GET /api/rate-films`). Each one is *Liked it*, *Not for me*
    or *Haven't seen it*. "Haven't seen it" swaps in another film, up to six
    times per genre. If nothing is liked, three more per genre are shown; after
    a second batch with nothing liked, the results are popular picks instead.
-3. **Services** and 4. **Kids**. Mood and time are not asked.
+4. **Services**, then the results. Mood and time are not asked.
 
 Each rated film is described by its TMDB attributes, with these weights:
 genres 1, keywords 1.5, director 2, lead cast 1, decade 0.5. A like adds those
@@ -135,9 +137,10 @@ film details and one Ember call.
 
 ### Watch with friends
 
-Everyone answers four questions: mood, genres (up to three, or skip), how long
-they have, and their streaming services. The host also says whether kids are
-watching.
+The host first says whether kids are watching; guests are told the answer
+(and, with kids, are not offered Horror). Then everyone answers four questions:
+mood, genres (up to three, or skip), how long they have, and their streaming
+services.
 
 By default (`PICKER` is `"random"` in `wrangler.jsonc`):
 

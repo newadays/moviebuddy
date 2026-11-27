@@ -330,7 +330,9 @@ await test('a group: join, shared picks, hidden votes, then the match', async ()
   const e = env();
   const id = await party(e);
   let s = await state(e, id, DANA);
-  assert.deepEqual({ joined: s.joined, hostName: s.hostName, memberCount: s.memberCount }, { joined: false, hostName: 'Gbenga', memberCount: 1 });
+  assert.deepEqual({ joined: s.joined, hostName: s.hostName, memberCount: s.memberCount, kids: s.kids }, { joined: false, hostName: 'Gbenga', memberCount: 1, kids: false });
+  // A guest invited to a family-safe group is told so before answering.
+  assert.equal((await state(e, await party(e, { kids: true }), DANA)).kids, true);
 
   await post(e, `/api/party/${id}/join`, { mid: DANA, name: 'Dana', answers: { mood: 'lighter', time: 'medium', services: [1899] } });
   await post(e, `/api/party/${id}/join`, { mid: SAM, name: 'Sam', answers: { mood: 'gripped', time: 'long', services: [] } });
@@ -608,6 +610,22 @@ await test('rate-films: about ten well-known films per genre, none twice, with w
   assert.equal(q.get('sort_by'), 'vote_count.desc', 'well known: most voted');
   assert.ok(subrequests() < 50, `subrequests ${subrequests()}`);
   assert.equal((await call(e, '/api/rate-films?genres=nope')).status, 400);
+});
+
+await test('rate-films: with kids watching, only films rated G or PG and never horror; adults are not limited', async () => {
+  const e = env();
+  await call(e, '/api/rate-films?genres=comedy&kids=1');
+  const kid = calls.tmdb.filter((c) => c.startsWith('/3/discover')).map((c) => new URL('https://x' + c).searchParams);
+  assert.ok(kid.length);
+  for (const q of kid) {
+    assert.equal(q.get('certification'), 'G|PG');
+    assert.equal(q.get('certification_country'), 'US');
+    assert.ok(q.get('without_genres').split(',').includes('27'), 'no horror');
+  }
+  calls.tmdb.length = 0;
+  await call(e, '/api/rate-films?genres=comedy');
+  const adult = calls.tmdb.filter((c) => c.startsWith('/3/discover')).map((c) => new URL('https://x' + c).searchParams);
+  assert.ok(adult.every((q) => !q.get('certification') && !q.get('without_genres')), 'adults rate any well-known film');
 });
 
 await test('rate-films: a thin genre (few well-known films) lowers the vote bar; rating more moves past films shown', async () => {
